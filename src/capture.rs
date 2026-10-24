@@ -341,7 +341,13 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::SetRemap(remap) => self.remap = *remap,
+                    CaptureRequest::SetRemap(remap) => {
+                        // Release using the old mapping before replacing it:
+                        // otherwise a held key's up event targets a different
+                        // key than its down event after a config reload.
+                        self.release_capture(capture, None).await?;
+                        self.remap = *remap;
+                    },
                     CaptureRequest::SetScrollInvert(scroll_invert) => {
                         self.scroll_invert = scroll_invert
                     }
