@@ -566,4 +566,33 @@ mod test {
         assert_eq!(r.release_key(KeyLeftMeta), Some(KeyLeftCtrl));
         assert_eq!(r.release_key(KeyA), Some(KeyA));
     }
+
+    #[test]
+    fn left_alt_super_swap_preserves_presses_releases_and_right_keys() {
+        use scancode::Linux::{KeyRightalt, KeyRightmeta};
+        let mut r = KeyRemap::new(
+            HashMap::from([(KeyLeftAlt, KeyLeftMeta), (KeyLeftMeta, KeyLeftAlt)]),
+            Vec::new(),
+        );
+        for state in [0, 1] {
+            for (source, target) in [
+                (KeyLeftAlt, KeyLeftMeta),
+                (KeyLeftMeta, KeyLeftAlt),
+                (KeyRightalt, KeyRightalt),
+                (KeyRightmeta, KeyRightmeta),
+            ] {
+                assert_eq!(r.apply(key_ev(source, state)), vec![key_ev(target, state)]);
+            }
+        }
+        // Capture release must target the keys sent to the peer.
+        assert_eq!(r.release_key(KeyLeftAlt), Some(KeyLeftMeta));
+        assert_eq!(r.release_key(KeyLeftMeta), Some(KeyLeftAlt));
+        assert_eq!(r.apply(mods(mask::MOD1)), vec![mods(mask::MOD4)]);
+        assert_eq!(r.apply(mods(mask::MOD4)), vec![mods(mask::MOD1)]);
+        assert_eq!(
+            r.apply(mods(mask::MOD1 | mask::MOD4)),
+            vec![mods(mask::MOD1 | mask::MOD4)]
+        );
+        assert_eq!(r.apply(mods(0)), vec![mods(0)]);
+    }
 }

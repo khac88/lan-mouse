@@ -450,6 +450,20 @@ KeyLeftCtrl = "KeyLeftMeta"
 Remapping happens on the *sending* side, so the local machine is unaffected:
 `release_bind` and the host's own shortcuts keep seeing the physical keys.
 
+For a Linux sender whose left Alt and Super keys are swapped locally, use
+this mapping to send physical left Alt as Command and physical left Super
+as Option on a macOS receiver:
+
+```toml
+[input_pre_processing.remap_keys]
+KeyLeftAlt = "KeyLeftMeta"
+KeyLeftMeta = "KeyLeftAlt"
+```
+
+This setting applies to every outgoing client. Incoming events are unchanged.
+Changing the mapping releases an active capture using the previous mapping
+before applying the new one, so held keys are not released as different keys.
+
 `remap_keys` is a plain per-key substitution — it can't tell "Command alone"
 from "Command as part of a chord", so it always sends a given key as the
 same thing. `remap_chords` covers that case: a modifier is sent as
