@@ -67,6 +67,7 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+cpal = { version = "0.18", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
@@ -90,6 +91,7 @@ libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
+audio = ["dep:cpal"]
 
 [package.metadata.bundle]
 name = "Lan Mouse"

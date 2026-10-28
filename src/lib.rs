@@ -1,3 +1,7 @@
+#[cfg(feature = "audio")]
+pub mod audio;
+#[cfg(feature = "audio")]
+pub mod audio_test;
 mod capture;
 pub mod capture_test;
 pub mod client;

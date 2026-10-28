@@ -1,3 +1,5 @@
+#[cfg(feature = "audio")]
+use crate::audio_test::{TestAudioCaptureArgs, TestAudioPlaybackArgs};
 use crate::capture_test::TestCaptureArgs;
 use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -142,6 +144,12 @@ pub enum Command {
     TestEmulation(TestEmulationArgs),
     /// test input capture
     TestCapture(TestCaptureArgs),
+    /// test loopback audio capture
+    #[cfg(feature = "audio")]
+    TestAudioCapture(TestAudioCaptureArgs),
+    /// test audio playback via jitter buffer
+    #[cfg(feature = "audio")]
+    TestAudioPlayback(TestAudioPlaybackArgs),
     /// Lan Mouse commandline interface
     Cli(CliArgs),
     /// run in daemon mode

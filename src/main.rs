@@ -1,6 +1,8 @@
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
+#[cfg(feature = "audio")]
+use lan_mouse::{audio::AudioError, audio_test};
 use lan_mouse::{
     capture_test,
     config::{self, Command, Config, ConfigError},
@@ -11,11 +13,7 @@ use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -38,6 +36,9 @@ enum LanMouseError {
     Gtk(#[from] GtkError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[cfg(feature = "audio")]
+    #[error(transparent)]
+    Audio(#[from] AudioError),
 }
 
 fn main() {
@@ -57,6 +58,10 @@ fn run() -> Result<(), LanMouseError> {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
+            #[cfg(feature = "audio")]
+            Command::TestAudioCapture(args) => run_async(audio_test::run_capture(args))?,
+            #[cfg(feature = "audio")]
+            Command::TestAudioPlayback(args) => run_async(audio_test::run_playback(args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
             Command::Daemon => {
                 // if daemon is specified we run the service
@@ -118,7 +123,8 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
-fn start_service() -> Result<Child, io::Error> {
+#[cfg(feature = "gtk")]
+fn start_service() -> Result<process::Child, io::Error> {
     let child = process::Command::new(std::env::current_exe()?)
         .args(std::env::args().skip(1))
         .arg("daemon")
