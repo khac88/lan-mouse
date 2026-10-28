@@ -482,6 +482,8 @@ impl JitterBuffer {
         if remaining_frames == 0 {
             self.state = PlayoutState::Buffering;
             self.gain = 0.0;
+            self.expected_seq = None;
+            self.recent_mask = 0;
             out_frame.fill(0);
             return false;
         }

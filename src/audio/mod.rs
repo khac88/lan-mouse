@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod jitter;
 pub mod playback;
+pub(crate) mod sender;
 
 use cpal::SampleFormat;
 use thiserror::Error;

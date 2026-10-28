@@ -32,7 +32,24 @@ pub enum ListenerCreationError {
     WebrtcDtls(#[from] webrtc_dtls::Error),
 }
 
-type ArcConn = Arc<dyn Conn + Send + Sync>;
+pub(crate) type ArcConn = Arc<dyn Conn + Send + Sync>;
+
+#[cfg(feature = "audio")]
+#[derive(Clone)]
+pub(crate) struct ListenerConns(Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>);
+
+#[cfg(feature = "audio")]
+impl ListenerConns {
+    pub(crate) async fn conn(&self, addr: SocketAddr) -> Option<ArcConn> {
+        self.0
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, c)| c.clone())
+    }
+}
 
 pub(crate) enum ListenEvent {
     Msg {
@@ -42,6 +59,9 @@ pub(crate) enum ListenEvent {
     Accept {
         addr: SocketAddr,
         fingerprint: String,
+    },
+    Disconnected {
+        addr: SocketAddr,
     },
     Rejected {
         fingerprint: String,
@@ -214,6 +234,11 @@ impl LanMouseListener {
         }
     }
 
+    #[cfg(feature = "audio")]
+    pub(crate) fn conns(&self) -> ListenerConns {
+        ListenerConns(self.conns.clone())
+    }
+
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         if let Some(conn) = self
             .conns
@@ -279,11 +304,19 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
-    let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    let still_connected_at_addr = {
+        let mut conns = conns.lock().await;
+        if let Some(index) = conns
+            .iter()
+            .position(|(a, c)| *a == addr && Arc::ptr_eq(c, &conn))
+            .or_else(|| conns.iter().position(|(a, _)| *a == addr))
+        {
+            conns.remove(index);
+        }
+        conns.iter().any(|(a, _)| *a == addr)
+    };
+    if !still_connected_at_addr {
+        let _ = dtls_tx.send(ListenEvent::Disconnected { addr });
+    }
     Ok(())
 }

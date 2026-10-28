@@ -390,9 +390,19 @@ fn build_stream_with_config(
     let stream_cfg: cpal::StreamConfig = (*supported_cfg).into();
 
     let err_shared = Arc::clone(shared);
-    let err_fn = move |err: cpal::Error| {
-        log::warn!("audio output stream error: {err}");
-        err_shared.stream_broken.store(true, Ordering::Release);
+    let err_fn = move |err: cpal::Error| match err.kind() {
+        cpal::ErrorKind::Xrun
+        | cpal::ErrorKind::DeviceChanged
+        | cpal::ErrorKind::RealtimeDenied => {
+            log::debug!(
+                "non-fatal audio output notification ({:?}): {err}",
+                err.kind()
+            );
+        }
+        _ => {
+            log::warn!("audio output stream error: {err}");
+            err_shared.stream_broken.store(true, Ordering::Release);
+        }
     };
 
     let data_shared = Arc::clone(shared);

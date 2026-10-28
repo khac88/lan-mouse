@@ -68,6 +68,9 @@ enum CaptureRequest {
     SetRemap(Box<KeyRemap>),
     /// set the scroll axes inverted on their way to other devices
     SetScrollInvert(ScrollInvert),
+    #[cfg(feature = "audio")]
+    /// establish DTLS connection eagerly so incoming audio can arrive
+    EnsureConnected(CaptureHandle),
 }
 
 impl Capture {
@@ -161,6 +164,13 @@ impl Capture {
             .request_tx
             .send(CaptureRequest::SetScrollInvert(scroll_invert));
     }
+
+    #[cfg(feature = "audio")]
+    pub(crate) fn ensure_connected(&self, handle: CaptureHandle) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::EnsureConnected(handle));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -248,6 +258,10 @@ impl CaptureTask {
                         CaptureRequest::SetScrollInvert(scroll_invert) => {
                             self.scroll_invert = scroll_invert
                         }
+                        #[cfg(feature = "audio")]
+                        CaptureRequest::EnsureConnected(h) => {
+                            self.conn.ensure_connected(h);
+                        }
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -285,10 +299,14 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, _capture_type) in captures {
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
+            }
+            #[cfg(feature = "audio")]
+            if _capture_type == CaptureType::Default {
+                self.conn.ensure_connected(handle);
             }
         }
         Ok(())
@@ -333,6 +351,10 @@ impl CaptureTask {
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
+                        #[cfg(feature = "audio")]
+                        if t == CaptureType::Default {
+                            self.conn.ensure_connected(h);
+                        }
                     }
                     CaptureRequest::Destroy(h) => {
                         self.remove_capture(h);
@@ -344,6 +366,10 @@ impl CaptureTask {
                     CaptureRequest::SetRemap(remap) => self.remap = *remap,
                     CaptureRequest::SetScrollInvert(scroll_invert) => {
                         self.scroll_invert = scroll_invert
+                    }
+                    #[cfg(feature = "audio")]
+                    CaptureRequest::EnsureConnected(h) => {
+                        self.conn.ensure_connected(h);
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

@@ -1,3 +1,5 @@
+#[cfg(feature = "audio")]
+use crate::audio::sender::AudioSender;
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
@@ -81,11 +83,15 @@ impl Emulation {
         listener: LanMouseListener,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
+        #[cfg(feature = "audio")]
+        let audio_sender = AudioSender::new(listener.conns(), cfg!(windows));
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
+            #[cfg(feature = "audio")]
+            audio_sender,
             request_rx,
             event_tx,
         };
@@ -134,6 +140,8 @@ impl Emulation {
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
+    #[cfg(feature = "audio")]
+    audio_sender: AudioSender,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
 }
@@ -148,7 +156,11 @@ impl ListenTask {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
                         log::trace!("{event} <-<-<-<-<- {addr}");
-                        last_response.insert(addr, Instant::now());
+                        let _was_tracked = last_response.insert(addr, Instant::now()).is_some();
+                        #[cfg(feature = "audio")]
+                        if !_was_tracked {
+                            self.audio_sender.peer_connected(addr);
+                        }
                         match event {
                             ProtoEvent::Enter(pos, t) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
@@ -184,7 +196,16 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        #[cfg(feature = "audio")]
+                        self.audio_sender.peer_connected(addr);
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                    }
+                    Some(ListenEvent::Disconnected { addr }) => {
+                        last_response.remove(&addr);
+                        self.emulation_proxy.remove(addr);
+                        #[cfg(feature = "audio")]
+                        self.audio_sender.peer_disconnected(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
@@ -214,6 +235,8 @@ impl ListenTask {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
+                            #[cfg(feature = "audio")]
+                            self.audio_sender.peer_disconnected(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {
@@ -223,6 +246,8 @@ impl ListenTask {
                 }
             }
         }
+        #[cfg(feature = "audio")]
+        self.audio_sender.terminate().await;
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }

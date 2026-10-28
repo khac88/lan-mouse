@@ -386,6 +386,14 @@ impl Service {
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
+                #[cfg(feature = "audio")]
+                if self
+                    .client_manager
+                    .get_state(handle)
+                    .is_some_and(|(_, s)| s.active)
+                {
+                    self.capture.ensure_connected(handle);
+                }
                 handle
             }
         };

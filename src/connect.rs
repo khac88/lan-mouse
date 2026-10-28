@@ -1,3 +1,5 @@
+#[cfg(feature = "audio")]
+use crate::audio::{jitter::DEFAULT_BUFFER_MS, playback::AudioPlayer};
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
@@ -100,6 +102,8 @@ pub(crate) struct LanMouseConnection {
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    #[cfg(feature = "audio")]
+    audio_player: Rc<RefCell<Option<AudioPlayer>>>,
 }
 
 impl LanMouseConnection {
@@ -113,11 +117,51 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
+            #[cfg(feature = "audio")]
+            audio_player: Rc::new(RefCell::new(Some(AudioPlayer::new(DEFAULT_BUFFER_MS)))),
         }
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    #[cfg(feature = "audio")]
+    pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
+        if self.audio_player.borrow().is_none() {
+            return;
+        }
+        let client_manager = self.client_manager.clone();
+        let cert = self.cert.clone();
+        let conns = self.conns.clone();
+        let connecting = self.connecting.clone();
+        let recv_tx = self.recv_tx.clone();
+        let ping_response = self.ping_response.clone();
+        let audio_player = self.audio_player.clone();
+        spawn_local(async move {
+            if let Some(addr) = client_manager.active_addr(handle) {
+                if conns.lock().await.contains_key(&addr) {
+                    return;
+                }
+            }
+            let mut guard = connecting.lock().await;
+            if guard.contains(&handle) {
+                return;
+            }
+            guard.insert(handle);
+            drop(guard);
+            let _ = connect_to_handle(
+                client_manager,
+                cert,
+                handle,
+                conns,
+                connecting,
+                recv_tx,
+                ping_response,
+                audio_player,
+            )
+            .await;
+        });
     }
 
     pub(crate) async fn send(
@@ -161,12 +205,15 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                #[cfg(feature = "audio")]
+                self.audio_player.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
@@ -175,6 +222,7 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
@@ -223,6 +271,8 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            #[cfg(feature = "audio")]
+            audio_player,
         ));
         return Ok(());
     }
@@ -258,6 +308,7 @@ async fn ping_pong(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
@@ -266,6 +317,7 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
 ) {
     let mut buf = [0u8; MAX_DATAGRAM_SIZE];
     while let Ok(n) = conn.recv(&mut buf).await {
@@ -292,6 +344,15 @@ async fn receive_loop(
                     frame.channels,
                     frame.samples.len()
                 );
+                #[cfg(feature = "audio")]
+                if let Some(ref player) = *audio_player.borrow() {
+                    player.push_packet(
+                        frame.seq,
+                        frame.sample_rate,
+                        frame.channels,
+                        &frame.samples,
+                    );
+                }
             }
             // Skip undecodable datagrams without dropping the
             // connection. Each DTLS recv is one framed message, so

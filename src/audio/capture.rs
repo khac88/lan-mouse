@@ -68,8 +68,18 @@ impl LoopbackCapture {
         let out_channels = chunker.out_channels();
 
         let err_tx = tx.clone();
-        let err_fn = move |err: cpal::Error| {
-            let _ = err_tx.try_send(CaptureMessage::StreamError(err.to_string()));
+        let err_fn = move |err: cpal::Error| match err.kind() {
+            cpal::ErrorKind::Xrun
+            | cpal::ErrorKind::DeviceChanged
+            | cpal::ErrorKind::RealtimeDenied => {
+                log::debug!(
+                    "non-fatal audio loopback notification ({:?}): {err}",
+                    err.kind()
+                );
+            }
+            _ => {
+                let _ = err_tx.try_send(CaptureMessage::StreamError(err.to_string()));
+            }
         };
 
         let timeout = Some(Duration::from_secs(2));
