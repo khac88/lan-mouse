@@ -75,3 +75,29 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+## Audio Streaming (`[audio]`)
+
+When built with `--features audio` (opt-in Cargo feature, off by default), `lan-mouse` can stream system output audio from a controlled Windows host back to the controlling peer over the existing authenticated DTLS UDP connection without installing virtual audio drivers:
+
+- **Capture (Windows):** Captures default render-endpoint audio via WASAPI loopback (`cpal`), downmixes/clamps to at most 48 kHz stereo `s16le`, and slices audio into 5 ms chunks (`240` stereo frames = `960` bytes PCM + `10`-byte header = `970` bytes per DTLS datagram, `EventType::Audio = 12`). Automatically reopens after ~2 s when the default output endpoint changes or disconnects.
+- **Playback (macOS / cross-platform `cpal`):** Decodes incoming `AudioFrame` datagrams into an adaptive jitter buffer (default `30` ms target, `80` ms overrun trim, missing-packet silence concealment, out-of-order recovery, `5` ms linear fade-in/out, and linear resampling if the output device rate differs), pausing the output unit after 5 s of inactivity.
+- **Cursor-gated routing:** On the listen side, streaming starts on `ProtoEvent::Enter` for the most recently entered peer and stops on `ProtoEvent::Leave`, `EmulationRequest::Release`, peer timeout, or disconnect (unless `only_while_active = false`). Both peers must run matching builds with widened (`2048`-byte) DTLS receive buffers.
+
+### Configuration
+
+```toml
+[audio]
+send = false              # Windows listen side: capture WASAPI loopback and send
+receive = false           # Connect side (e.g. macOS): play incoming AudioFrame packets
+only_while_active = true  # Stream only while the remote cursor is inside this machine
+buffer_ms = 30            # Receiver jitter buffer target latency in milliseconds
+```
+
+### Diagnostic Subcommands
+
+```sh
+lan-mouse test-audio-capture --duration-secs 5
+lan-mouse test-audio-playback --duration-secs 2 --freq-hz 440
+```
+
+
