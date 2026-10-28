@@ -195,7 +195,69 @@ fn run_capture_worker(
 enum SenderCmd {
     PeerConnected(SocketAddr),
     PeerDisconnected(SocketAddr),
+    PeerEntered(SocketAddr),
+    PeerLeft(SocketAddr),
+    SetConfig {
+        enabled: bool,
+        only_while_active: bool,
+    },
     Terminate,
+}
+
+#[derive(Clone, Debug)]
+struct RoutingState {
+    enabled: bool,
+    only_while_active: bool,
+    connected_peers: Vec<SocketAddr>,
+    active_peer: Option<SocketAddr>,
+}
+
+impl RoutingState {
+    fn new(enabled: bool, only_while_active: bool) -> Self {
+        Self {
+            enabled,
+            only_while_active,
+            connected_peers: Vec::new(),
+            active_peer: None,
+        }
+    }
+
+    fn peer_connected(&mut self, addr: SocketAddr) {
+        self.connected_peers.retain(|&a| a != addr);
+        self.connected_peers.push(addr);
+    }
+
+    fn peer_disconnected(&mut self, addr: SocketAddr) {
+        self.connected_peers.retain(|&a| a != addr);
+        if self.active_peer == Some(addr) {
+            self.active_peer = None;
+        }
+    }
+
+    fn peer_entered(&mut self, addr: SocketAddr) {
+        if !self.connected_peers.contains(&addr) {
+            self.connected_peers.push(addr);
+        }
+        self.active_peer = Some(addr);
+    }
+
+    fn peer_left(&mut self, addr: SocketAddr) {
+        if self.active_peer == Some(addr) {
+            self.active_peer = None;
+        }
+    }
+
+    fn desired_dest(&self, platform_supported: bool) -> Option<SocketAddr> {
+        if !self.enabled || !platform_supported {
+            return None;
+        }
+        if self.only_while_active {
+            self.active_peer
+        } else {
+            self.active_peer
+                .or_else(|| self.connected_peers.last().copied())
+        }
+    }
 }
 
 pub(crate) struct AudioSender {
@@ -204,9 +266,9 @@ pub(crate) struct AudioSender {
 }
 
 impl AudioSender {
-    pub(crate) fn new(conns: ListenerConns, enabled: bool) -> Self {
+    pub(crate) fn new(conns: ListenerConns, enabled: bool, only_while_active: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let sender_task = SenderTask::new(conns, cmd_rx, enabled);
+        let sender_task = SenderTask::new(conns, cmd_rx, enabled, only_while_active);
         let task = spawn_local(sender_task.run());
         Self { cmd_tx, task }
     }
@@ -217,6 +279,21 @@ impl AudioSender {
 
     pub(crate) fn peer_disconnected(&self, addr: SocketAddr) {
         let _ = self.cmd_tx.send(SenderCmd::PeerDisconnected(addr));
+    }
+
+    pub(crate) fn peer_entered(&self, addr: SocketAddr) {
+        let _ = self.cmd_tx.send(SenderCmd::PeerEntered(addr));
+    }
+
+    pub(crate) fn peer_left(&self, addr: SocketAddr) {
+        let _ = self.cmd_tx.send(SenderCmd::PeerLeft(addr));
+    }
+
+    pub(crate) fn set_config(&self, enabled: bool, only_while_active: bool) {
+        let _ = self.cmd_tx.send(SenderCmd::SetConfig {
+            enabled,
+            only_while_active,
+        });
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -231,9 +308,8 @@ struct SenderTask {
     chunk_tx: mpsc::Sender<CaptureMessage>,
     chunk_rx: mpsc::Receiver<CaptureMessage>,
     worker: Option<CaptureWorkerHandle>,
-    enabled: bool,
+    routing: RoutingState,
     warned_unsupported: bool,
-    connected_peers: Vec<SocketAddr>,
     current_dest: Option<SocketAddr>,
     cached_conn: Option<(SocketAddr, ArcConn)>,
     next_seq: u32,
@@ -245,6 +321,7 @@ impl SenderTask {
         conns: ListenerConns,
         cmd_rx: mpsc::UnboundedReceiver<SenderCmd>,
         enabled: bool,
+        only_while_active: bool,
     ) -> Self {
         let (chunk_tx, chunk_rx) = mpsc::channel(64);
         Self {
@@ -253,9 +330,8 @@ impl SenderTask {
             chunk_tx,
             chunk_rx,
             worker: None,
-            enabled,
+            routing: RoutingState::new(enabled, only_while_active),
             warned_unsupported: false,
-            connected_peers: Vec::new(),
             current_dest: None,
             cached_conn: None,
             next_seq: 0,
@@ -263,23 +339,13 @@ impl SenderTask {
         }
     }
 
-    fn desired_dest(&self) -> Option<SocketAddr> {
-        if !self.enabled {
-            return None;
-        }
-        if !cfg!(windows) {
-            return None;
-        }
-        self.connected_peers.last().copied()
-    }
-
     fn sync_state(&mut self) {
-        if self.enabled && !cfg!(windows) && !self.warned_unsupported {
+        if self.routing.enabled && !cfg!(windows) && !self.warned_unsupported {
             log::warn!("audio send is enabled, but loopback capture is only supported on Windows");
             self.warned_unsupported = true;
         }
 
-        let desired = self.desired_dest();
+        let desired = self.routing.desired_dest(cfg!(windows));
         if desired == self.current_dest {
             return;
         }
@@ -329,16 +395,28 @@ impl SenderTask {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(SenderCmd::PeerConnected(addr)) => {
-                        self.connected_peers.retain(|&a| a != addr);
-                        self.connected_peers.push(addr);
+                        self.routing.peer_connected(addr);
                         self.cached_conn = None;
                         self.sync_state();
                     }
                     Some(SenderCmd::PeerDisconnected(addr)) => {
-                        self.connected_peers.retain(|&a| a != addr);
+                        self.routing.peer_disconnected(addr);
                         if self.cached_conn.as_ref().is_some_and(|(a, _)| *a == addr) {
                             self.cached_conn = None;
                         }
+                        self.sync_state();
+                    }
+                    Some(SenderCmd::PeerEntered(addr)) => {
+                        self.routing.peer_entered(addr);
+                        self.sync_state();
+                    }
+                    Some(SenderCmd::PeerLeft(addr)) => {
+                        self.routing.peer_left(addr);
+                        self.sync_state();
+                    }
+                    Some(SenderCmd::SetConfig { enabled, only_while_active }) => {
+                        self.routing.enabled = enabled;
+                        self.routing.only_while_active = only_while_active;
                         self.sync_state();
                     }
                     Some(SenderCmd::Terminate) | None => break,
@@ -386,5 +464,69 @@ impl SenderTask {
                 .await
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 10, 3, 226], port))
+    }
+
+    #[test]
+    fn active_only_routes_strictly_between_enter_and_leave() {
+        let mut r = RoutingState::new(true, true);
+        let peer_a = addr(50001);
+        let peer_b = addr(50002);
+
+        r.peer_connected(peer_a);
+        assert_eq!(r.desired_dest(true), None);
+
+        r.peer_entered(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_a));
+
+        // Second peer entering steals the single active audio stream
+        r.peer_entered(peer_b);
+        assert_eq!(r.desired_dest(true), Some(peer_b));
+
+        // Leaving an already-inactive peer does not stop the current active peer
+        r.peer_left(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_b));
+
+        // Leaving the active peer stops streaming
+        r.peer_left(peer_b);
+        assert_eq!(r.desired_dest(true), None);
+
+        // Disconnect while entered also stops streaming
+        r.peer_entered(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_a));
+        r.peer_disconnected(peer_a);
+        assert_eq!(r.desired_dest(true), None);
+    }
+
+    #[test]
+    fn continuous_mode_streams_while_connected_and_respects_enable_flag() {
+        let mut r = RoutingState::new(true, false);
+        let peer_a = addr(50001);
+        let peer_b = addr(50002);
+
+        assert_eq!(r.desired_dest(true), None);
+        r.peer_connected(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_a));
+
+        r.peer_connected(peer_b);
+        assert_eq!(r.desired_dest(true), Some(peer_b));
+
+        // Explicit Enter on peer_a overrides fallback connection order
+        r.peer_entered(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_a));
+        r.peer_left(peer_a);
+        assert_eq!(r.desired_dest(true), Some(peer_b));
+
+        // Disabling send stops routing immediately
+        r.enabled = false;
+        assert_eq!(r.desired_dest(true), None);
     }
 }

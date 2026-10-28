@@ -1,6 +1,8 @@
 #[cfg(feature = "audio")]
-use crate::audio::{jitter::DEFAULT_BUFFER_MS, playback::AudioPlayer};
+use crate::audio::playback::AudioPlayer;
 use crate::client::ClientManager;
+#[cfg(feature = "audio")]
+use crate::config::AudioConfig;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
@@ -44,6 +46,8 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "audio")]
+const AUDIO_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 async fn connect(
     addr: SocketAddr,
@@ -107,8 +111,18 @@ pub(crate) struct LanMouseConnection {
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        #[cfg(feature = "audio")] audio: AudioConfig,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
+        #[cfg(feature = "audio")]
+        let player = if audio.receive {
+            Some(AudioPlayer::new(audio.buffer_ms))
+        } else {
+            None
+        };
         Self {
             cert,
             client_manager,
@@ -118,7 +132,7 @@ impl LanMouseConnection {
             recv_tx,
             ping_response: Default::default(),
             #[cfg(feature = "audio")]
-            audio_player: Rc::new(RefCell::new(Some(AudioPlayer::new(DEFAULT_BUFFER_MS)))),
+            audio_player: Rc::new(RefCell::new(player)),
         }
     }
 
@@ -127,41 +141,48 @@ impl LanMouseConnection {
     }
 
     #[cfg(feature = "audio")]
+    pub(crate) fn set_audio_config(&self, audio: AudioConfig) {
+        let mut need_connect = false;
+        {
+            let mut guard = self.audio_player.borrow_mut();
+            match (audio.receive, guard.as_ref()) {
+                (true, Some(player)) => {
+                    player.set_buffer_ms(audio.buffer_ms);
+                }
+                (true, None) => {
+                    *guard = Some(AudioPlayer::new(audio.buffer_ms));
+                    need_connect = true;
+                }
+                (false, Some(_)) => {
+                    *guard = None;
+                    log::info!("audio playback disabled");
+                }
+                (false, None) => {}
+            }
+        }
+        if need_connect {
+            for handle in self.client_manager.active_clients() {
+                self.ensure_connected(handle);
+            }
+        }
+    }
+
+    #[cfg(feature = "audio")]
     pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
         if self.audio_player.borrow().is_none() {
             return;
         }
-        let client_manager = self.client_manager.clone();
-        let cert = self.cert.clone();
-        let conns = self.conns.clone();
-        let connecting = self.connecting.clone();
-        let recv_tx = self.recv_tx.clone();
-        let ping_response = self.ping_response.clone();
-        let audio_player = self.audio_player.clone();
-        spawn_local(async move {
-            if let Some(addr) = client_manager.active_addr(handle) {
-                if conns.lock().await.contains_key(&addr) {
-                    return;
-                }
-            }
-            let mut guard = connecting.lock().await;
-            if guard.contains(&handle) {
-                return;
-            }
-            guard.insert(handle);
-            drop(guard);
-            let _ = connect_to_handle(
-                client_manager,
-                cert,
-                handle,
-                conns,
-                connecting,
-                recv_tx,
-                ping_response,
-                audio_player,
-            )
-            .await;
-        });
+        spawn_audio_connect(
+            self.client_manager.clone(),
+            self.cert.clone(),
+            handle,
+            self.conns.clone(),
+            self.connecting.clone(),
+            self.recv_tx.clone(),
+            self.ping_response.clone(),
+            self.audio_player.clone(),
+            Duration::ZERO,
+        );
     }
 
     pub(crate) async fn send(
@@ -213,6 +234,58 @@ impl LanMouseConnection {
     }
 }
 
+#[cfg(feature = "audio")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_audio_connect(
+    client_manager: ClientManager,
+    cert: Certificate,
+    handle: ClientHandle,
+    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    tx: Sender<(ClientHandle, ProtoEvent)>,
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    audio_player: Rc<RefCell<Option<AudioPlayer>>>,
+    delay: Duration,
+) {
+    spawn_local(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if audio_player.borrow().is_none() {
+            return;
+        }
+        if !client_manager
+            .get_state(handle)
+            .is_some_and(|(_, s)| s.active)
+        {
+            return;
+        }
+        if let Some(addr) = client_manager.active_addr(handle) {
+            if conns.lock().await.contains_key(&addr) {
+                return;
+            }
+        }
+        {
+            let mut guard = connecting.lock().await;
+            if guard.contains(&handle) {
+                return;
+            }
+            guard.insert(handle);
+        }
+        let _ = connect_to_handle(
+            client_manager,
+            cert,
+            handle,
+            conns,
+            connecting,
+            tx,
+            ping_response,
+            audio_player,
+        )
+        .await;
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
@@ -227,17 +300,35 @@ async fn connect_to_handle(
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
     if let Some(addrs) = client_manager.get_ips(handle) {
+        if addrs.is_empty() {
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
         let addrs = addrs
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
+        let res = connect_any(&addrs, cert.clone()).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
+                #[cfg(feature = "audio")]
+                if audio_player.borrow().is_some() {
+                    spawn_audio_connect(
+                        client_manager,
+                        cert,
+                        handle,
+                        conns,
+                        connecting,
+                        tx,
+                        ping_response,
+                        audio_player,
+                        AUDIO_RECONNECT_DELAY,
+                    );
+                }
                 return Err(e);
             }
         };
@@ -265,10 +356,14 @@ async fn connect_to_handle(
         // receiver
         spawn_local(receive_loop(
             client_manager,
+            #[cfg(feature = "audio")]
+            cert,
             handle,
             addr,
             conn,
             conns,
+            #[cfg(feature = "audio")]
+            connecting,
             tx,
             ping_response.clone(),
             #[cfg(feature = "audio")]
@@ -311,10 +406,12 @@ async fn ping_pong(
 #[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
+    #[cfg(feature = "audio")] cert: Certificate,
     handle: ClientHandle,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    #[cfg(feature = "audio")] connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
@@ -363,6 +460,20 @@ async fn receive_loop(
     }
     log::warn!("recv error");
     disconnect(&client_manager, handle, addr, &conns).await;
+    #[cfg(feature = "audio")]
+    if audio_player.borrow().is_some() {
+        spawn_audio_connect(
+            client_manager,
+            cert,
+            handle,
+            conns,
+            connecting,
+            tx,
+            ping_response,
+            audio_player,
+            AUDIO_RECONNECT_DELAY,
+        );
+    }
 }
 
 async fn disconnect(

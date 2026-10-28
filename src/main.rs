@@ -138,6 +138,8 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     let remap_chords = config.remap_chords();
     let invert_scroll_vertical = config.invert_scroll_vertical();
     let invert_scroll_horizontal = config.invert_scroll_horizontal();
+    #[cfg(feature = "audio")]
+    let audio = config.audio();
     let config_path = config.config_path().to_owned();
     let mut service = Service::new(config).await?;
     log::info!("using config: {config_path:?}");
@@ -158,6 +160,18 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     }
     if invert_scroll_horizontal {
         log::info!("inverting horizontal scroll direction on its way to other devices");
+    }
+    #[cfg(feature = "audio")]
+    {
+        if audio.send {
+            log::info!(
+                "audio capture/send enabled (only_while_active = {})",
+                audio.only_while_active
+            );
+        }
+        if audio.receive {
+            log::info!("audio playback enabled (buffer_ms = {})", audio.buffer_ms);
+        }
     }
     service.run().await?;
     log::info!("service exited!");

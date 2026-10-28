@@ -74,6 +74,8 @@ enum EmulationRequest {
     /// given normalized cross-axis position
     Release(SocketAddr, f64),
     ChangePort(u16),
+    #[cfg(feature = "audio")]
+    SetAudioConfig(crate::config::AudioConfig),
     Terminate,
 }
 
@@ -81,10 +83,12 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        #[cfg(feature = "audio")] audio: crate::config::AudioConfig,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         #[cfg(feature = "audio")]
-        let audio_sender = AudioSender::new(listener.conns(), cfg!(windows));
+        let audio_sender =
+            AudioSender::new(listener.conns(), audio.send, audio.only_while_active);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -119,6 +123,13 @@ impl Emulation {
         self.request_tx
             .send(EmulationRequest::ChangePort(port))
             .expect("channel closed")
+    }
+
+    #[cfg(feature = "audio")]
+    pub(crate) fn set_audio_config(&self, audio: crate::config::AudioConfig) {
+        let _ = self
+            .request_tx
+            .send(EmulationRequest::SetAudioConfig(audio));
     }
 
     pub(crate) async fn event(&mut self) -> EmulationEvent {
@@ -168,11 +179,15 @@ impl ListenTask {
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
+                                    #[cfg(feature = "audio")]
+                                    self.audio_sender.peer_entered(addr);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(..) => {
                                 self.emulation_proxy.remove(addr);
+                                #[cfg(feature = "audio")]
+                                self.audio_sender.peer_left(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
@@ -222,11 +237,19 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr, t) => self.listener.reply(addr, ProtoEvent::Leave(0, t)).await,
+                    EmulationRequest::Release(addr, t) => {
+                        #[cfg(feature = "audio")]
+                        self.audio_sender.peer_left(addr);
+                        self.listener.reply(addr, ProtoEvent::Leave(0, t)).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                    }
+                    #[cfg(feature = "audio")]
+                    EmulationRequest::SetAudioConfig(audio) => {
+                        self.audio_sender.set_config(audio.send, audio.only_while_active);
                     }
                     EmulationRequest::Terminate => break,
                 },

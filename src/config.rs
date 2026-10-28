@@ -74,6 +74,42 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    audio: Option<AudioConfig>,
+}
+
+fn default_only_while_active() -> bool {
+    true
+}
+
+fn default_buffer_ms() -> u32 {
+    30
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioConfig {
+    /// capture system audio via loopback and send to active/connected peer
+    #[serde(default)]
+    pub send: bool,
+    /// play back incoming audio frames from connected peers
+    #[serde(default)]
+    pub receive: bool,
+    /// send audio only while a remote cursor is actively controlling this machine
+    #[serde(default = "default_only_while_active")]
+    pub only_while_active: bool,
+    /// target playout jitter buffer depth in milliseconds on the receiving side
+    #[serde(default = "default_buffer_ms")]
+    pub buffer_ms: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            send: false,
+            receive: false,
+            only_while_active: default_only_while_active(),
+            buffer_ms: default_buffer_ms(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -557,6 +593,14 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// audio streaming configuration
+    pub fn audio(&self) -> AudioConfig {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.audio)
+            .unwrap_or_default()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -639,5 +683,95 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip_via_write_back(input: &str) -> ConfigToml {
+        let parsed: ConfigToml = toml::from_str(input).expect("initial toml::from_str");
+        let serialized =
+            toml_edit::ser::to_string_pretty(&parsed).expect("toml_edit::ser::to_string_pretty");
+        let reparsed_toml: ConfigToml =
+            toml::from_str(&serialized).expect("reparse via toml::from_str");
+        let doc: DocumentMut = serialized.parse().expect("parse DocumentMut");
+        let reparsed_doc: ConfigToml =
+            toml_edit::de::from_document(doc).expect("reparse via toml_edit::de::from_document");
+        assert_eq!(parsed, reparsed_toml);
+        assert_eq!(parsed, reparsed_doc);
+        reparsed_doc
+    }
+
+    #[test]
+    fn audio_config_round_trip_preserves_all_fields() {
+        let raw = r#"
+port = 4242
+
+[input_pre_processing]
+invert_scroll_vertical = true
+
+[[clients]]
+hostname = "10.10.3.230"
+ips = ["10.10.3.230"]
+position = "top"
+activate_on_startup = true
+
+[authorized_fingerprints]
+"aa:bb:cc" = "peer"
+
+[audio]
+send = false
+receive = true
+only_while_active = false
+buffer_ms = 45
+"#;
+        let cfg = round_trip_via_write_back(raw);
+        assert_eq!(
+            cfg.audio,
+            Some(AudioConfig {
+                send: false,
+                receive: true,
+                only_while_active: false,
+                buffer_ms: 45,
+            })
+        );
+    }
+
+    #[test]
+    fn audio_config_partial_table_fills_sensible_defaults_and_survives_write_back() {
+        let raw = r#"
+[audio]
+send = true
+"#;
+        let cfg = round_trip_via_write_back(raw);
+        assert_eq!(
+            cfg.audio,
+            Some(AudioConfig {
+                send: true,
+                receive: false,
+                only_while_active: true,
+                buffer_ms: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn omitted_audio_section_defaults_to_disabled_and_stays_none_on_write_back() {
+        let raw = r#"
+port = 4242
+"#;
+        let cfg = round_trip_via_write_back(raw);
+        assert_eq!(cfg.audio, None);
+        assert_eq!(
+            cfg.audio.unwrap_or_default(),
+            AudioConfig {
+                send: false,
+                receive: false,
+                only_while_active: true,
+                buffer_ms: 30,
+            }
+        );
     }
 }

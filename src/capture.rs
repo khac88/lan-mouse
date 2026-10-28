@@ -71,6 +71,9 @@ enum CaptureRequest {
     #[cfg(feature = "audio")]
     /// establish DTLS connection eagerly so incoming audio can arrive
     EnsureConnected(CaptureHandle),
+    #[cfg(feature = "audio")]
+    /// update audio playback configuration
+    SetAudioConfig(crate::config::AudioConfig),
 }
 
 impl Capture {
@@ -171,6 +174,11 @@ impl Capture {
             .request_tx
             .send(CaptureRequest::EnsureConnected(handle));
     }
+
+    #[cfg(feature = "audio")]
+    pub(crate) fn set_audio_config(&self, audio: crate::config::AudioConfig) {
+        let _ = self.request_tx.send(CaptureRequest::SetAudioConfig(audio));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -261,6 +269,10 @@ impl CaptureTask {
                         #[cfg(feature = "audio")]
                         CaptureRequest::EnsureConnected(h) => {
                             self.conn.ensure_connected(h);
+                        }
+                        #[cfg(feature = "audio")]
+                        CaptureRequest::SetAudioConfig(audio) => {
+                            self.conn.set_audio_config(audio);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -370,6 +382,10 @@ impl CaptureTask {
                     #[cfg(feature = "audio")]
                     CaptureRequest::EnsureConnected(h) => {
                         self.conn.ensure_connected(h);
+                    }
+                    #[cfg(feature = "audio")]
+                    CaptureRequest::SetAudioConfig(audio) => {
+                        self.conn.set_audio_config(audio);
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

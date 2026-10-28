@@ -93,10 +93,22 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let audio_config = config.audio();
+        #[cfg(not(feature = "audio"))]
+        if audio_config.send || audio_config.receive {
+            log::warn!(
+                "[audio] is enabled in config, but lan-mouse was built without the `audio` feature; ignoring"
+            );
+        }
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            #[cfg(feature = "audio")]
+            audio_config,
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -111,7 +123,12 @@ impl Service {
             ),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(
+            emulation_backend,
+            listener,
+            #[cfg(feature = "audio")]
+            audio_config,
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -274,6 +291,18 @@ impl Service {
             self.config.invert_scroll_vertical(),
             self.config.invert_scroll_horizontal(),
         ));
+        let audio_config = self.config.audio();
+        #[cfg(feature = "audio")]
+        {
+            self.capture.set_audio_config(audio_config);
+            self.emulation.set_audio_config(audio_config);
+        }
+        #[cfg(not(feature = "audio"))]
+        if audio_config.send || audio_config.receive {
+            log::warn!(
+                "[audio] is enabled in config, but lan-mouse was built without the `audio` feature; ignoring"
+            );
+        }
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
