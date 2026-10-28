@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -267,10 +267,10 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
-            Ok(event) => {
+    let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+    while let Ok(n) = conn.recv(&mut buf).await {
+        match Datagram::decode(&buf[..n]) {
+            Ok(Datagram::Event(event)) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
                     ProtoEvent::Pong(b) => {
@@ -283,6 +283,15 @@ async fn receive_loop(
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }
+            }
+            Ok(Datagram::Audio(frame)) => {
+                log::trace!(
+                    "{addr} <==<==<== Audio(seq={}, {} Hz, {} ch, {} samples)",
+                    frame.seq,
+                    frame.sample_rate,
+                    frame.channels,
+                    frame.samples.len()
+                );
             }
             // Skip undecodable datagrams without dropping the
             // connection. Each DTLS recv is one framed message, so

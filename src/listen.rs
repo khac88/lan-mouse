@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -251,13 +251,19 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
+    let mut b = [0u8; MAX_DATAGRAM_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
-            Ok(event) => dtls_tx
+    while let Ok(n) = conn.recv(&mut b).await {
+        match Datagram::decode(&b[..n]) {
+            Ok(Datagram::Event(event)) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),
+            Ok(Datagram::Audio(frame)) => {
+                log::trace!(
+                    "ignoring audio datagram on listen side from {addr} (seq={})",
+                    frame.seq
+                );
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full

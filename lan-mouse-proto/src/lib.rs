@@ -12,15 +12,31 @@ use thiserror::Error;
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
+/// Fixed header size of an [`AudioFrame`] datagram:
+/// `tag (u8) + seq (u32 BE) + sample_rate (u32 BE) + channels (u8)`.
+pub const AUDIO_HEADER_SIZE: usize =
+    size_of::<u8>() + size_of::<u32>() + size_of::<u32>() + size_of::<u8>();
+
+/// Receive buffer size for DTLS datagrams so both control/input events
+/// (`<= 21` bytes) and 5 ms raw PCM audio frames (`~970` bytes at 48 kHz
+/// stereo `s16le`) fit comfortably.
+pub const MAX_DATAGRAM_SIZE: usize = 2048;
+
 /// error type for protocol violations
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    /// datagram has zero bytes
+    #[error("empty datagram")]
+    EmptyDatagram,
     /// event type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidEventId(#[from] TryFromPrimitiveError<EventType>),
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// audio datagram routed to fixed-size ProtoEvent decoder or malformed
+    #[error("invalid audio frame: {0}")]
+    InvalidAudioFrame(&'static str),
 }
 
 /// Position of a client
@@ -106,7 +122,7 @@ impl Display for ProtoEvent {
     }
 }
 
-#[derive(TryFromPrimitive, IntoPrimitive)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum EventType {
     PointerMotion,
@@ -121,6 +137,7 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    Audio,
 }
 
 impl ProtoEvent {
@@ -208,6 +225,9 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
+            EventType::Audio => Err(ProtocolError::InvalidAudioFrame(
+                "audio datagrams must be decoded via AudioFrame::decode",
+            )),
         }
     }
 }
@@ -325,3 +345,251 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+/// Variable-length raw PCM audio datagram sent over the DTLS session.
+///
+/// Wire layout:
+/// - `byte 0`    : [`EventType::Audio`] (`= 12`)
+/// - `byte 1..5` : `seq` (`u32` big-endian)
+/// - `byte 5..9` : `sample_rate` (`u32` big-endian)
+/// - `byte 9`    : `channels` (`u8`)
+/// - `byte 10..` : interleaved `s16le` PCM samples
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioFrame {
+    pub seq: u32,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub samples: Vec<i16>,
+}
+
+impl AudioFrame {
+    /// Encodes this audio frame into a reusable byte buffer, clearing `out`
+    /// beforehand.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(AUDIO_HEADER_SIZE + self.samples.len() * size_of::<i16>());
+        out.push(EventType::Audio as u8);
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.sample_rate.to_be_bytes());
+        out.push(self.channels);
+        for &sample in &self.samples {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+
+    /// Encodes this audio frame into a newly allocated byte vector.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AUDIO_HEADER_SIZE + self.samples.len() * size_of::<i16>());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Decodes a variable-length [`AudioFrame`] from a raw DTLS datagram slice.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+        if buf.len() < AUDIO_HEADER_SIZE {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "packet shorter than 10-byte audio header",
+            ));
+        }
+        let event_type = EventType::try_from(buf[0])?;
+        if event_type != EventType::Audio {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "unexpected event tag for audio frame",
+            ));
+        }
+        let seq = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+        let sample_rate = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+        let channels = buf[9];
+        if sample_rate == 0 {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "sample_rate must be non-zero",
+            ));
+        }
+        if channels == 0 {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "channels must be non-zero",
+            ));
+        }
+
+        let pcm = &buf[AUDIO_HEADER_SIZE..];
+        if !pcm.len().is_multiple_of(size_of::<i16>()) {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "PCM payload byte length is not a multiple of 2",
+            ));
+        }
+        let sample_count = pcm.len() / size_of::<i16>();
+        if !sample_count.is_multiple_of(channels as usize) {
+            return Err(ProtocolError::InvalidAudioFrame(
+                "PCM sample count is not divisible by channel count",
+            ));
+        }
+
+        let mut samples = Vec::with_capacity(sample_count);
+        for chunk in pcm.chunks_exact(size_of::<i16>()) {
+            samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+
+        Ok(Self {
+            seq,
+            sample_rate,
+            channels,
+            samples,
+        })
+    }
+}
+
+/// Top-level DTLS datagram dispatcher distinguishing fixed-size control/input
+/// events from variable-length audio frames.
+#[derive(Clone, Debug)]
+pub enum Datagram {
+    Event(ProtoEvent),
+    Audio(AudioFrame),
+}
+
+impl Datagram {
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+        let Some(&tag) = buf.first() else {
+            return Err(ProtocolError::EmptyDatagram);
+        };
+        if tag == EventType::Audio as u8 {
+            AudioFrame::decode(buf).map(Self::Audio)
+        } else {
+            let mut event_buf = [0u8; MAX_EVENT_SIZE];
+            let copy_len = buf.len().min(MAX_EVENT_SIZE);
+            event_buf[..copy_len].copy_from_slice(&buf[..copy_len]);
+            ProtoEvent::try_from(event_buf).map(Self::Event)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_event_type_is_12() {
+        assert_eq!(EventType::Audio as u8, 12);
+    }
+
+    #[test]
+    fn audio_frame_round_trip_and_wire_layout() {
+        let samples: Vec<i16> = (0..480).map(|i| (i * 137 - 32000) as i16).collect();
+        let frame = AudioFrame {
+            seq: 0x0102_0304,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: samples.clone(),
+        };
+
+        let wire = frame.encode();
+        assert_eq!(wire.len(), 10 + 960);
+        assert_eq!(wire[0], 12);
+        assert_eq!(&wire[1..5], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&wire[5..9], &48_000u32.to_be_bytes());
+        assert_eq!(wire[9], 2);
+        assert_eq!(&wire[10..12], &samples[0].to_le_bytes());
+
+        let decoded = AudioFrame::decode(&wire).expect("valid audio frame");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn audio_frame_rejects_malformed_inputs() {
+        // Shorter than 10-byte header
+        assert!(AudioFrame::decode(&[12, 0, 0, 0, 1]).is_err());
+
+        // Zero sample rate
+        let mut bad_rate = AudioFrame {
+            seq: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![100, -100],
+        }
+        .encode();
+        bad_rate[5..9].copy_from_slice(&0u32.to_be_bytes());
+        assert!(AudioFrame::decode(&bad_rate).is_err());
+
+        // Zero channels
+        let mut bad_ch = AudioFrame {
+            seq: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![100, -100],
+        }
+        .encode();
+        bad_ch[9] = 0;
+        assert!(AudioFrame::decode(&bad_ch).is_err());
+
+        // Odd PCM byte length
+        let mut odd = AudioFrame {
+            seq: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![100, -100],
+        }
+        .encode();
+        odd.push(0xAA);
+        assert!(AudioFrame::decode(&odd).is_err());
+
+        // Sample count not divisible by channels (3 samples for 2 channels)
+        let mut misaligned = AudioFrame {
+            seq: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![100, -100],
+        }
+        .encode();
+        misaligned.extend_from_slice(&42i16.to_le_bytes());
+        assert!(AudioFrame::decode(&misaligned).is_err());
+    }
+
+    #[test]
+    fn datagram_dispatch_isolates_audio_and_proto_events() {
+        // Audio datagram dispatches to Datagram::Audio and is rejected by ProtoEvent::try_from
+        let audio = AudioFrame {
+            seq: 77,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: (0..480).map(|i| (i * 19 - 4000) as i16).collect(),
+        };
+        let audio_wire = audio.encode();
+        match Datagram::decode(&audio_wire).expect("datagram decode") {
+            Datagram::Audio(decoded) => assert_eq!(decoded, audio),
+            Datagram::Event(ev) => panic!("audio packet misdecoded as ProtoEvent: {ev}"),
+        }
+
+        let mut fixed = [0u8; MAX_EVENT_SIZE];
+        let copy_len = audio_wire.len().min(MAX_EVENT_SIZE);
+        fixed[..copy_len].copy_from_slice(&audio_wire[..copy_len]);
+        assert!(ProtoEvent::try_from(fixed).is_err());
+
+        // ProtoEvent datagrams dispatch to Datagram::Event and are rejected by AudioFrame::decode
+        let events = [
+            ProtoEvent::Ping,
+            ProtoEvent::Pong(true),
+            ProtoEvent::Enter(Position::Right, 0.25),
+            ProtoEvent::Leave(42, 0.75),
+            ProtoEvent::Hello {
+                commit: *b"1234abcd",
+            },
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 99,
+                dx: -3.5,
+                dy: 12.25,
+            })),
+        ];
+        for ev in events {
+            let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ev.into();
+            let slice = &buf[..len];
+            assert!(AudioFrame::decode(slice).is_err());
+            match Datagram::decode(slice).expect("proto event decode") {
+                Datagram::Event(decoded) => assert_eq!(format!("{decoded}"), format!("{ev}")),
+                Datagram::Audio(_) => panic!("ProtoEvent misdecoded as AudioFrame"),
+            }
+        }
+
+        // Empty and unknown event IDs fail cleanly
+        assert!(Datagram::decode(&[]).is_err());
+        assert!(Datagram::decode(&[250, 1, 2, 3]).is_err());
+    }
+}
