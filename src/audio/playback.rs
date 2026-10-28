@@ -5,7 +5,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cpal::{
@@ -19,6 +19,7 @@ use crate::audio::{
 };
 
 const REOPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
+const IDLE_PAUSE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct PlaybackDeviceInfo {
@@ -33,24 +34,26 @@ struct SharedState {
     resampler: LinearResampler,
     desired_rate: u32,
     desired_channels: u8,
+    last_packet_at: Option<Instant>,
 }
 
 struct Shared {
     state: Mutex<SharedState>,
     stream_broken: AtomicBool,
-    stream_open: AtomicBool,
+    stream_active: AtomicBool,
 }
 
 enum PlayerCmd {
     EnsureOpen,
     Reconfigure,
+    StreamBroken,
     Shutdown,
 }
 
 /// Real-time audio output sink backed by [`JitterBuffer`] and `cpal`.
 ///
 /// Incoming packets are pushed without blocking from the network receive loop;
-/// stream creation and recovery (e.g. when switching headphones) run on a
+/// stream creation, idle pause/resume, and device hotplug recovery run on a
 /// dedicated lightweight manager thread so Tokio tasks never block on OS audio
 /// initialization.
 #[derive(Clone)]
@@ -93,16 +96,18 @@ impl AudioPlayer {
                 resampler: LinearResampler::new(initial_rate, initial_rate),
                 desired_rate: initial_rate,
                 desired_channels: initial_channels,
+                last_packet_at: None,
             }),
             stream_broken: AtomicBool::new(false),
-            stream_open: AtomicBool::new(false),
+            stream_active: AtomicBool::new(false),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PlayerCmd>(8);
         let worker_shared = Arc::clone(&shared);
+        let worker_cmd_tx = cmd_tx.clone();
         let handle = thread::Builder::new()
             .name("lan-mouse-audio-out".to_owned())
-            .spawn(move || run_player_worker(worker_shared, cmd_rx, None))
+            .spawn(move || run_player_worker(worker_shared, worker_cmd_tx, cmd_rx, None))
             .expect("failed to spawn audio playback worker");
 
         let guard = Arc::new(WorkerGuard {
@@ -135,19 +140,29 @@ impl AudioPlayer {
                 resampler: LinearResampler::new(sample_rate, sample_rate),
                 desired_rate: sample_rate,
                 desired_channels: channels,
+                last_packet_at: Some(Instant::now()),
             }),
             stream_broken: AtomicBool::new(false),
-            stream_open: AtomicBool::new(false),
+            stream_active: AtomicBool::new(false),
         });
 
-        let (stream, info) = open_output_stream(&shared, sample_rate, channels)?;
-        shared.stream_open.store(true, Ordering::Release);
-
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PlayerCmd>(8);
+        let (stream, info) = open_output_stream(&shared, &cmd_tx, sample_rate, channels)?;
+        shared.stream_active.store(true, Ordering::Release);
+
         let worker_shared = Arc::clone(&shared);
+        let worker_cmd_tx = cmd_tx.clone();
+        let worker_info = info.clone();
         let handle = thread::Builder::new()
             .name("lan-mouse-audio-out".to_owned())
-            .spawn(move || run_player_worker(worker_shared, cmd_rx, Some(stream)))
+            .spawn(move || {
+                run_player_worker(
+                    worker_shared,
+                    worker_cmd_tx,
+                    cmd_rx,
+                    Some((stream, worker_info)),
+                )
+            })
             .expect("failed to spawn audio playback worker");
 
         let guard = Arc::new(WorkerGuard {
@@ -180,12 +195,13 @@ impl AudioPlayer {
                 guard.desired_channels = channels;
                 format_changed = true;
             }
+            guard.last_packet_at = Some(Instant::now());
             guard.jitter.push(seq, sample_rate, channels, samples);
         }
 
         if format_changed {
             let _ = self.cmd_tx.try_send(PlayerCmd::Reconfigure);
-        } else if !self.shared.stream_open.load(Ordering::Acquire)
+        } else if !self.shared.stream_active.load(Ordering::Acquire)
             || self.shared.stream_broken.load(Ordering::Acquire)
         {
             let _ = self.cmd_tx.try_send(PlayerCmd::EnsureOpen);
@@ -195,60 +211,205 @@ impl AudioPlayer {
 
 fn run_player_worker(
     shared: Arc<Shared>,
+    cmd_tx: mpsc::SyncSender<PlayerCmd>,
     cmd_rx: mpsc::Receiver<PlayerCmd>,
-    mut current_stream: Option<cpal::Stream>,
+    mut current_stream: Option<(cpal::Stream, PlaybackDeviceInfo)>,
 ) {
+    let mut is_playing = current_stream.is_some();
+    let mut want_playing = is_playing;
+    let mut retry_after: Option<Instant> = None;
     let mut warned_open_failure = false;
 
     loop {
-        let timeout = if current_stream.is_none() || shared.stream_broken.load(Ordering::Acquire) {
-            REOPEN_RETRY_DELAY
+        let wait_timeout = if want_playing && current_stream.is_none() {
+            Some(match retry_after {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => Duration::ZERO,
+            })
+        } else if is_playing {
+            let idle_rem = shared
+                .state
+                .lock()
+                .ok()
+                .and_then(|g| g.last_packet_at)
+                .map(|last| {
+                    IDLE_PAUSE_DELAY
+                        .saturating_sub(last.elapsed())
+                        .max(Duration::from_millis(250))
+                })
+                .unwrap_or(IDLE_PAUSE_DELAY);
+            Some(idle_rem)
         } else {
-            Duration::from_secs(3600)
+            None
         };
 
-        let mut want_reopen = false;
-        match cmd_rx.recv_timeout(timeout) {
-            Ok(PlayerCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                drop(current_stream);
-                shared.stream_open.store(false, Ordering::Release);
-                return;
-            }
-            Ok(PlayerCmd::EnsureOpen) => {
-                if current_stream.is_none() || shared.stream_broken.load(Ordering::Acquire) {
-                    want_reopen = true;
+        match wait_timeout {
+            None => match cmd_rx.recv() {
+                Ok(PlayerCmd::Shutdown) | Err(mpsc::RecvError) => {
+                    drop(current_stream);
+                    shared.stream_active.store(false, Ordering::Release);
+                    return;
                 }
-            }
-            Ok(PlayerCmd::Reconfigure) => {
-                want_reopen = true;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if shared.stream_broken.load(Ordering::Acquire) {
-                    want_reopen = true;
+                Ok(PlayerCmd::EnsureOpen) => {
+                    want_playing = true;
+                }
+                Ok(PlayerCmd::Reconfigure) => {
+                    want_playing = true;
+                    retry_after = None;
+                    if current_stream.take().is_some() {
+                        is_playing = false;
+                        shared.stream_active.store(false, Ordering::Release);
+                        log::info!("reconfiguring audio playback stream");
+                    }
+                }
+                Ok(PlayerCmd::StreamBroken) => {
+                    current_stream = None;
+                    is_playing = false;
+                    shared.stream_active.store(false, Ordering::Release);
+                    shared.stream_broken.store(false, Ordering::Release);
+                    retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+                    continue;
+                }
+            },
+            Some(timeout) if !timeout.is_zero() => match cmd_rx.recv_timeout(timeout) {
+                Ok(PlayerCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    drop(current_stream);
+                    shared.stream_active.store(false, Ordering::Release);
+                    return;
+                }
+                Ok(PlayerCmd::EnsureOpen) => {
+                    want_playing = true;
+                }
+                Ok(PlayerCmd::Reconfigure) => {
+                    want_playing = true;
+                    retry_after = None;
+                    if current_stream.take().is_some() {
+                        is_playing = false;
+                        shared.stream_active.store(false, Ordering::Release);
+                        log::info!("reconfiguring audio playback stream");
+                    }
+                }
+                Ok(PlayerCmd::StreamBroken) => {
+                    current_stream = None;
+                    is_playing = false;
+                    shared.stream_active.store(false, Ordering::Release);
+                    shared.stream_broken.store(false, Ordering::Release);
+                    retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if is_playing {
+                        let is_idle = shared.state.lock().is_ok_and(|g| {
+                            !g.jitter.is_playing()
+                                && g.last_packet_at
+                                    .is_none_or(|t| t.elapsed() >= IDLE_PAUSE_DELAY)
+                        });
+                        if is_idle {
+                            if let Some((ref stream, _)) = current_stream {
+                                match stream.pause() {
+                                    Ok(()) => {
+                                        is_playing = false;
+                                        want_playing = false;
+                                        shared.stream_active.store(false, Ordering::Release);
+                                        log::info!("audio playback paused (idle)");
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "failed to pause audio playback stream (dropping): {e}"
+                                        );
+                                        current_stream = None;
+                                        is_playing = false;
+                                        want_playing = false;
+                                        shared.stream_active.store(false, Ordering::Release);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            Some(_) => {
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        PlayerCmd::Shutdown => {
+                            drop(current_stream);
+                            shared.stream_active.store(false, Ordering::Release);
+                            return;
+                        }
+                        PlayerCmd::EnsureOpen => {
+                            want_playing = true;
+                        }
+                        PlayerCmd::Reconfigure => {
+                            want_playing = true;
+                            retry_after = None;
+                            if current_stream.take().is_some() {
+                                is_playing = false;
+                                shared.stream_active.store(false, Ordering::Release);
+                                log::info!("reconfiguring audio playback stream");
+                            }
+                        }
+                        PlayerCmd::StreamBroken => {
+                            current_stream = None;
+                            is_playing = false;
+                            shared.stream_active.store(false, Ordering::Release);
+                            shared.stream_broken.store(false, Ordering::Release);
+                            retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+                        }
+                    }
                 }
             }
         }
 
-        if !want_reopen {
+        if shared.stream_broken.swap(false, Ordering::AcqRel) {
+            current_stream = None;
+            is_playing = false;
+            shared.stream_active.store(false, Ordering::Release);
+            retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+        }
+
+        if !want_playing {
             continue;
         }
 
-        // Drop any invalidated stream before opening a replacement.
-        if current_stream.take().is_some() {
-            shared.stream_open.store(false, Ordering::Release);
-            log::info!("closing previous audio playback stream before reopen");
+        if let Some(deadline) = retry_after {
+            if Instant::now() < deadline {
+                continue;
+            }
+            retry_after = None;
         }
-        shared.stream_broken.store(false, Ordering::Release);
+
+        if let Some((ref stream, ref info)) = current_stream {
+            if !is_playing {
+                match stream.play() {
+                    Ok(()) => {
+                        is_playing = true;
+                        shared.stream_active.store(true, Ordering::Release);
+                        log::info!("audio playback resumed on '{}'", info.name);
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("failed to resume audio playback stream (reopening): {e}");
+                        current_stream = None;
+                        shared.stream_active.store(false, Ordering::Release);
+                    }
+                }
+            } else {
+                continue;
+            }
+        }
 
         let (desired_rate, desired_channels) = match shared.state.lock() {
             Ok(g) => (g.desired_rate, g.desired_channels),
             Err(_) => continue,
         };
 
-        match open_output_stream(&shared, desired_rate, desired_channels) {
+        match open_output_stream(&shared, &cmd_tx, desired_rate, desired_channels) {
             Ok((stream, info)) => {
                 warned_open_failure = false;
-                shared.stream_open.store(true, Ordering::Release);
+                is_playing = true;
+                shared.stream_active.store(true, Ordering::Release);
                 log::info!(
                     "audio playback started on '{}' ({} Hz, {} ch, {:?})",
                     info.name,
@@ -256,15 +417,16 @@ fn run_player_worker(
                     info.channels,
                     info.sample_format
                 );
-                current_stream = Some(stream);
+                current_stream = Some((stream, info));
             }
             Err(e) => {
                 if !warned_open_failure {
-                    log::warn!("failed to open audio output stream (will retry): {e}");
+                    log::warn!("failed to open audio output stream (will retry in 2s): {e}");
                     warned_open_failure = true;
                 } else {
                     log::debug!("audio output reopen attempt failed: {e}");
                 }
+                retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
             }
         }
     }
@@ -332,6 +494,7 @@ fn score_config(cfg: &SupportedStreamConfig, desired_channels: u8) -> u8 {
 
 fn open_output_stream(
     shared: &Arc<Shared>,
+    cmd_tx: &mpsc::SyncSender<PlayerCmd>,
     desired_rate: u32,
     desired_channels: u8,
 ) -> Result<(cpal::Stream, PlaybackDeviceInfo), AudioError> {
@@ -348,7 +511,7 @@ fn open_output_stream(
     let (primary_cfg, fallback_cfg) =
         select_output_config(&device, desired_rate, desired_channels)?;
 
-    let chosen_res = build_stream_with_config(&device, &primary_cfg, shared);
+    let chosen_res = build_stream_with_config(&device, &primary_cfg, shared, cmd_tx);
     let (stream, active_cfg) = match (chosen_res, fallback_cfg) {
         (Ok(s), _) => (s, primary_cfg),
         (Err(e), Some(fallback)) => {
@@ -357,7 +520,7 @@ fn open_output_stream(
                 primary_cfg.sample_rate(),
                 fallback.sample_rate()
             );
-            let s = build_stream_with_config(&device, &fallback, shared)?;
+            let s = build_stream_with_config(&device, &fallback, shared, cmd_tx)?;
             (s, fallback)
         }
         (Err(e), None) => return Err(e),
@@ -383,6 +546,7 @@ fn build_stream_with_config(
     device: &cpal::Device,
     supported_cfg: &SupportedStreamConfig,
     shared: &Arc<Shared>,
+    cmd_tx: &mpsc::SyncSender<PlayerCmd>,
 ) -> Result<cpal::Stream, AudioError> {
     let sample_format = supported_cfg.sample_format();
     let out_rate = supported_cfg.sample_rate();
@@ -390,18 +554,22 @@ fn build_stream_with_config(
     let stream_cfg: cpal::StreamConfig = (*supported_cfg).into();
 
     let err_shared = Arc::clone(shared);
+    let err_cmd_tx = cmd_tx.clone();
     let err_fn = move |err: cpal::Error| match err.kind() {
-        cpal::ErrorKind::Xrun
-        | cpal::ErrorKind::DeviceChanged
-        | cpal::ErrorKind::RealtimeDenied => {
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => {
             log::debug!(
                 "non-fatal audio output notification ({:?}): {err}",
                 err.kind()
             );
         }
+        cpal::ErrorKind::DeviceChanged => {
+            log::info!("audio playback route changed: {err}");
+        }
         _ => {
-            log::warn!("audio output stream error: {err}");
+            log::warn!("audio output stream error (reopening in 2s): {err}");
             err_shared.stream_broken.store(true, Ordering::Release);
+            err_shared.stream_active.store(false, Ordering::Release);
+            let _ = err_cmd_tx.try_send(PlayerCmd::StreamBroken);
         }
     };
 

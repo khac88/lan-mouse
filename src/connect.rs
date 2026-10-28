@@ -47,13 +47,27 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "audio")]
-const AUDIO_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const AUDIO_RECONNECT_BASE_SECS: u64 = 2;
+#[cfg(feature = "audio")]
+const AUDIO_RECONNECT_MAX_SECS: u64 = 15;
+
+#[cfg(feature = "audio")]
+fn reconnect_backoff(attempt: u32) -> Duration {
+    let shift = attempt.min(3);
+    let secs = (AUDIO_RECONNECT_BASE_SECS << shift).min(AUDIO_RECONNECT_MAX_SECS);
+    Duration::from_secs(secs)
+}
 
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    quiet: bool,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
-    log::info!("connecting to {addr} ...");
+    if quiet {
+        log::debug!("connecting to {addr} ...");
+    } else {
+        log::info!("connecting to {addr} ...");
+    }
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -80,10 +94,11 @@ async fn connect(
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
+    quiet: bool,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), quiet));
     }
     loop {
         match joinset.join_next().await {
@@ -91,7 +106,11 @@ async fn connect_any(
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
                 Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
+                    if quiet {
+                        log::debug!("failed to connect to {a}: `{e}`");
+                    } else {
+                        log::warn!("failed to connect to {a}: `{e}`");
+                    }
                 }
             },
         };
@@ -182,6 +201,7 @@ impl LanMouseConnection {
             self.ping_response.clone(),
             self.audio_player.clone(),
             Duration::ZERO,
+            0,
         );
     }
 
@@ -228,6 +248,7 @@ impl LanMouseConnection {
                 self.ping_response.clone(),
                 #[cfg(feature = "audio")]
                 self.audio_player.clone(),
+                0,
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -246,6 +267,7 @@ fn spawn_audio_connect(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     audio_player: Rc<RefCell<Option<AudioPlayer>>>,
     delay: Duration,
+    attempt: u32,
 ) {
     spawn_local(async move {
         if !delay.is_zero() {
@@ -281,6 +303,7 @@ fn spawn_audio_connect(
             tx,
             ping_response,
             audio_player,
+            attempt,
         )
         .await;
     });
@@ -296,8 +319,14 @@ async fn connect_to_handle(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
+    attempt: u32,
 ) -> Result<(), LanMouseConnectionError> {
-    log::info!("client {handle} connecting ...");
+    let quiet = attempt > 0;
+    if quiet {
+        log::debug!("client {handle} reconnecting (attempt {}) ...", attempt + 1);
+    } else {
+        log::info!("client {handle} connecting ...");
+    }
     // sending did not work, figure out active conn.
     if let Some(addrs) = client_manager.get_ips(handle) {
         if addrs.is_empty() {
@@ -309,14 +338,19 @@ async fn connect_to_handle(
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert.clone()).await;
+        if quiet {
+            log::debug!("client ({handle}) connecting ... (ips: {addrs:?})");
+        } else {
+            log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+        }
+        let res = connect_any(&addrs, cert.clone(), quiet).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
                 connecting.lock().await.remove(&handle);
                 #[cfg(feature = "audio")]
                 if audio_player.borrow().is_some() {
+                    let next_attempt = attempt.saturating_add(1);
                     spawn_audio_connect(
                         client_manager,
                         cert,
@@ -326,7 +360,8 @@ async fn connect_to_handle(
                         tx,
                         ping_response,
                         audio_player,
-                        AUDIO_RECONNECT_DELAY,
+                        reconnect_backoff(attempt),
+                        next_attempt,
                     );
                 }
                 return Err(e);
@@ -471,7 +506,8 @@ async fn receive_loop(
             tx,
             ping_response,
             audio_player,
-            AUDIO_RECONNECT_DELAY,
+            reconnect_backoff(0),
+            1,
         );
     }
 }
@@ -488,4 +524,18 @@ async fn disconnect(
     client_manager.set_peer_commit(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+}
+
+#[cfg(all(test, feature = "audio"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_starts_at_2s_and_caps_at_15s() {
+        assert_eq!(reconnect_backoff(0), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(4));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(8));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(15));
+        assert_eq!(reconnect_backoff(100), Duration::from_secs(15));
+    }
 }

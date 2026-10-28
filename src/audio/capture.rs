@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use cpal::{
     SampleFormat,
@@ -30,6 +36,8 @@ pub enum CaptureMessage {
 pub struct LoopbackCapture {
     stream: cpal::Stream,
     info: CaptureDeviceInfo,
+    broken: Arc<AtomicBool>,
+    reset_chunker: Arc<AtomicBool>,
 }
 
 impl LoopbackCapture {
@@ -67,7 +75,11 @@ impl LoopbackCapture {
         let out_sample_rate = chunker.out_sample_rate();
         let out_channels = chunker.out_channels();
 
+        let broken = Arc::new(AtomicBool::new(false));
+        let reset_chunker = Arc::new(AtomicBool::new(false));
+
         let err_tx = tx.clone();
+        let err_broken = Arc::clone(&broken);
         let err_fn = move |err: cpal::Error| match err.kind() {
             cpal::ErrorKind::Xrun
             | cpal::ErrorKind::DeviceChanged
@@ -78,15 +90,20 @@ impl LoopbackCapture {
                 );
             }
             _ => {
+                err_broken.store(true, Ordering::Release);
                 let _ = err_tx.try_send(CaptureMessage::StreamError(err.to_string()));
             }
         };
 
+        let reset_flag = Arc::clone(&reset_chunker);
         let timeout = Some(Duration::from_secs(2));
         let stream = match native_sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 stream_cfg,
                 move |data: &[f32], _| {
+                    if reset_flag.swap(false, Ordering::AcqRel) {
+                        chunker.reset();
+                    }
                     chunker.push_f32(data, |chunk| {
                         let _ = tx.try_send(CaptureMessage::Chunk(chunk));
                     });
@@ -97,6 +114,9 @@ impl LoopbackCapture {
             SampleFormat::I16 => device.build_input_stream(
                 stream_cfg,
                 move |data: &[i16], _| {
+                    if reset_flag.swap(false, Ordering::AcqRel) {
+                        chunker.reset();
+                    }
                     chunker.push_i16(data, |chunk| {
                         let _ = tx.try_send(CaptureMessage::Chunk(chunk));
                     });
@@ -109,6 +129,9 @@ impl LoopbackCapture {
                 device.build_input_stream(
                     stream_cfg,
                     move |data: &[u16], _| {
+                        if reset_flag.swap(false, Ordering::AcqRel) {
+                            chunker.reset();
+                        }
                         scratch.clear();
                         scratch.extend(data.iter().copied().map(u16_to_f32));
                         chunker.push_f32(&scratch, |chunk| {
@@ -124,6 +147,9 @@ impl LoopbackCapture {
                 device.build_input_stream(
                     stream_cfg,
                     move |data: &[i32], _| {
+                        if reset_flag.swap(false, Ordering::AcqRel) {
+                            chunker.reset();
+                        }
                         scratch.clear();
                         scratch.extend(data.iter().copied().map(i32_to_f32));
                         chunker.push_f32(&scratch, |chunk| {
@@ -146,10 +172,16 @@ impl LoopbackCapture {
             out_channels,
         };
 
-        Ok(Self { stream, info })
+        Ok(Self {
+            stream,
+            info,
+            broken,
+            reset_chunker,
+        })
     }
 
     pub fn play(&self) -> Result<(), AudioError> {
+        self.reset_chunker.store(true, Ordering::Release);
         self.stream.play()?;
         Ok(())
     }
@@ -157,6 +189,10 @@ impl LoopbackCapture {
     pub fn pause(&self) -> Result<(), AudioError> {
         self.stream.pause()?;
         Ok(())
+    }
+
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::Acquire)
     }
 
     pub fn info(&self) -> &CaptureDeviceInfo {

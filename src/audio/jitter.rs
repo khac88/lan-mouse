@@ -99,6 +99,15 @@ impl FrameChunker {
         self.out_channels
     }
 
+    /// Discard any partial frame state left over before a pause so a resumed
+    /// capture session starts cleanly on fresh samples.
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.resample_pos = 0.0;
+        self.prev_stereo = [0.0, 0.0];
+        self.has_prev = false;
+    }
+
     /// Push interleaved `f32` samples from the capture callback and emit any
     /// completed 5 ms chunks.
     pub fn push_f32(&mut self, data: &[f32], mut on_chunk: impl FnMut(PcmChunk)) {
@@ -805,5 +814,74 @@ mod tests {
         let mut out = vec![0.0f32; 441];
         resampler.fill_f32(&mut jb, 1, &mut out);
         assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-3));
+    }
+
+    #[test]
+    fn burst_drain_silence_then_restarted_seq_fades_in_cleanly() {
+        let cfg = JitterConfig {
+            target_ms: 15,
+            max_ms: 80,
+            fade_ms: 5,
+        };
+        let mut jb = JitterBuffer::new(RATE, 1, cfg);
+
+        // First burst (seq 0..3 = 15 ms).
+        for seq in 0..3 {
+            jb.push(seq, RATE, 1, &[10_000; 5]);
+        }
+        let mut out = [0i16; 20];
+        jb.read_i16(&mut out);
+        assert_eq!(&out[0..5], &[2000, 4000, 6000, 8000, 10_000]);
+        assert_eq!(&out[5..10], &[10_000; 5]);
+        assert_eq!(&out[10..15], &[8000, 6000, 4000, 2000, 0]);
+        assert_eq!(&out[15..20], &[0; 5]);
+        assert!(!jb.is_playing());
+
+        // Peer restarts or re-enters starting again at seq = 0: must not be
+        // mistaken for duplicate packets, and must ramp smoothly from 0 again.
+        for seq in 0..3 {
+            jb.push(seq, RATE, 1, &[5_000; 5]);
+        }
+        let mut out2 = [0i16; 15];
+        jb.read_i16(&mut out2);
+        assert_eq!(&out2[0..5], &[1000, 2000, 3000, 4000, 5000]);
+        assert_eq!(&out2[5..10], &[5000; 5]);
+        assert_eq!(&out2[10..15], &[4000, 3000, 2000, 1000, 0]);
+    }
+
+    #[test]
+    fn sub_buffer_pause_resume_with_seq_jump_never_drops_as_duplicate() {
+        let mut jb = JitterBuffer::new(RATE, CH, no_fade_cfg());
+        for seq in 0..6 {
+            jb.push(seq, RATE, CH, &const_packet(1000));
+        }
+        // Drain only 15 ms, leaving 15 ms still queued.
+        let mut half = vec![0i16; 15 * CH as usize];
+        jb.read_i16(&mut half);
+        assert_eq!(jb.buffered_frames(), 15);
+
+        // Sender paused and resumed with a 128-packet sequence jump.
+        jb.push(134, RATE, CH, &const_packet(2000));
+        jb.push(135, RATE, CH, &const_packet(2000));
+        assert_eq!(jb.buffered_frames(), 25);
+
+        let mut drained = vec![0i16; 25 * CH as usize];
+        jb.read_i16(&mut drained);
+        assert!(drained[..30].iter().all(|&s| s == 1000));
+        assert!(drained[30..].iter().all(|&s| s == 2000));
+    }
+
+    #[test]
+    fn chunker_reset_discards_stale_partial_frame() {
+        let mut chunker = FrameChunker::new(48_000, 2);
+        // Push 100 samples (< 480 samples needed for a 5 ms stereo chunk).
+        let mut chunks = Vec::new();
+        chunker.push_i16(&[9999i16; 100], |c| chunks.push(c));
+        assert!(chunks.is_empty());
+
+        chunker.reset();
+        chunker.push_i16(&[1234i16; 480], |c| chunks.push(c));
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].samples.iter().all(|&s| s == 1234));
     }
 }

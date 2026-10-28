@@ -87,8 +87,7 @@ impl Emulation {
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         #[cfg(feature = "audio")]
-        let audio_sender =
-            AudioSender::new(listener.conns(), audio.send, audio.only_while_active);
+        let audio_sender = AudioSender::new(listener.conns(), audio.send, audio.only_while_active);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {

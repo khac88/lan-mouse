@@ -60,6 +60,11 @@ impl Drop for CaptureWorkerHandle {
     }
 }
 
+/// Sequence jump inserted whenever capture stops so a rapid pause/resume (faster
+/// than the receiver's jitter buffer drain) is unambiguously treated as a new
+/// burst rather than missing or duplicate packets.
+const STREAM_RESTART_SEQ_JUMP: u32 = 128;
+
 fn run_capture_worker(
     cmd_rx: std_mpsc::Receiver<CaptureWorkerCmd>,
     chunk_tx: mpsc::Sender<CaptureMessage>,
@@ -71,26 +76,38 @@ fn run_capture_worker(
     let mut warned_open_failure = false;
 
     loop {
-        let timeout = if want_capturing && current_capture.is_none() {
-            match retry_after {
+        let wait_timeout = if want_capturing && current_capture.is_none() {
+            Some(match retry_after {
                 Some(deadline) => deadline.saturating_duration_since(Instant::now()),
                 None => Duration::ZERO,
-            }
+            })
         } else {
-            Duration::from_secs(3600)
+            None
         };
 
-        if !timeout.is_zero() {
-            match cmd_rx.recv_timeout(timeout) {
+        match wait_timeout {
+            None => match cmd_rx.recv() {
+                Ok(CaptureWorkerCmd::Shutdown) | Err(std_mpsc::RecvError) => {
+                    drop(current_capture);
+                    return;
+                }
+                Ok(CaptureWorkerCmd::SetCapturing(active)) => {
+                    want_capturing = active;
+                }
+                Ok(CaptureWorkerCmd::StreamBroken) => {
+                    current_capture = None;
+                    is_playing = false;
+                    retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+                    continue;
+                }
+            },
+            Some(timeout) if !timeout.is_zero() => match cmd_rx.recv_timeout(timeout) {
                 Ok(CaptureWorkerCmd::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                     drop(current_capture);
                     return;
                 }
                 Ok(CaptureWorkerCmd::SetCapturing(active)) => {
                     want_capturing = active;
-                    if active && retry_after.is_none() {
-                        // Immediate start/resume.
-                    }
                 }
                 Ok(CaptureWorkerCmd::StreamBroken) => {
                     current_capture = None;
@@ -99,24 +116,31 @@ fn run_capture_worker(
                     continue;
                 }
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-            }
-        } else {
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    CaptureWorkerCmd::Shutdown => {
-                        drop(current_capture);
-                        return;
-                    }
-                    CaptureWorkerCmd::SetCapturing(active) => {
-                        want_capturing = active;
-                    }
-                    CaptureWorkerCmd::StreamBroken => {
-                        current_capture = None;
-                        is_playing = false;
-                        retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+            },
+            Some(_) => {
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        CaptureWorkerCmd::Shutdown => {
+                            drop(current_capture);
+                            return;
+                        }
+                        CaptureWorkerCmd::SetCapturing(active) => {
+                            want_capturing = active;
+                        }
+                        CaptureWorkerCmd::StreamBroken => {
+                            current_capture = None;
+                            is_playing = false;
+                            retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
+                        }
                     }
                 }
             }
+        }
+
+        if current_capture.as_ref().is_some_and(|c| c.is_broken()) {
+            current_capture = None;
+            is_playing = false;
+            retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
         }
 
         if !want_capturing {
@@ -174,8 +198,14 @@ fn run_capture_worker(
                     current_capture = Some(capture);
                 }
                 Err(e) => {
-                    log::warn!("failed to start audio loopback capture (will retry in 2s): {e}");
-                    warned_open_failure = true;
+                    if !warned_open_failure {
+                        log::warn!(
+                            "failed to start audio loopback capture (will retry in 2s): {e}"
+                        );
+                        warned_open_failure = true;
+                    } else {
+                        log::debug!("audio loopback capture start retry failed: {e}");
+                    }
                     retry_after = Some(Instant::now() + REOPEN_RETRY_DELAY);
                 }
             },
@@ -369,7 +399,15 @@ impl SenderTask {
                 if let Some(ref w) = self.worker {
                     w.send(CaptureWorkerCmd::SetCapturing(false));
                 }
-                while self.chunk_rx.try_recv().is_ok() {}
+                while let Ok(msg) = self.chunk_rx.try_recv() {
+                    if let CaptureMessage::StreamError(err) = msg {
+                        log::warn!("audio loopback stream error (reopening in 2s): {err}");
+                        if let Some(ref w) = self.worker {
+                            w.send(CaptureWorkerCmd::StreamBroken);
+                        }
+                    }
+                }
+                self.next_seq = self.next_seq.wrapping_add(STREAM_RESTART_SEQ_JUMP);
                 self.cached_conn = None;
             }
             (None, None) => {}
@@ -527,6 +565,26 @@ mod tests {
 
         // Disabling send stops routing immediately
         r.enabled = false;
+        assert_eq!(r.desired_dest(true), None);
+
+        // Unsupported host OS never activates loopback capture
+        r.enabled = true;
+        assert_eq!(r.desired_dest(false), None);
+    }
+
+    #[test]
+    fn toggling_only_while_active_live_switches_between_idle_and_connected_peer() {
+        let mut r = RoutingState::new(true, true);
+        let peer = addr(50001);
+        r.peer_connected(peer);
+        assert_eq!(r.desired_dest(true), None);
+
+        // Hot-reload to continuous mode starts streaming without requiring Enter
+        r.only_while_active = false;
+        assert_eq!(r.desired_dest(true), Some(peer));
+
+        // Hot-reload back to active-only pauses until cursor enters
+        r.only_while_active = true;
         assert_eq!(r.desired_dest(true), None);
     }
 }
