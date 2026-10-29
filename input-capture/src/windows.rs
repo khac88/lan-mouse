@@ -48,7 +48,7 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        let (event_tx, event_rx) = channel(32);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,

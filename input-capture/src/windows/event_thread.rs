@@ -6,6 +6,7 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -19,11 +20,12 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+    RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -98,9 +100,19 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
+/// How often the low-level hooks are re-registered. Windows (7 and later)
+/// silently removes a `WH_*_LL` hook whose callback exceeds
+/// `LowLevelHooksTimeout` — which can happen under load, around sleep /
+/// lock-screen transitions, etc. Once that happens no barrier ever fires
+/// again, so a cursor that entered this device can never leave it.
+/// Periodic re-registration bounds that outage to this interval.
+const HOOK_REFRESH_INTERVAL_MS: u32 = 5_000;
+
+/// After a capture is released, barrier crossings are ignored for this
+/// long. The cursor is left on the edge pixel it crossed at, so without
+/// this the next (possibly still in-flight) motion event re-triggers the
+/// barrier straight away, producing a storm of `Begin` events.
+const REARM_DELAY: Duration = Duration::from_millis(250);
 
 fn try_send_event(
     pos: Position,
@@ -122,6 +134,47 @@ thread_local! {
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// currently registered low-level (mouse, keyboard) hooks
+    static HOOKS: Cell<Option<(HHOOK, HHOOK)>> = const { Cell::new(None) };
+    /// barrier crossings are ignored until this instant (see [`REARM_DELAY`])
+    static REARM_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// (Re-)registers the low-level mouse and keyboard hooks. The new hooks
+/// are installed before the old ones are removed so no input slips
+/// through unobserved in between.
+fn install_hooks() {
+    let mouse_proc: HOOKPROC = Some(mouse_proc);
+    let kybrd_proc: HOOKPROC = Some(kybrd_proc);
+    let hooks = unsafe {
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0);
+        let kybrd = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0);
+        match (mouse, kybrd) {
+            (Ok(m), Ok(k)) => Some((m, k)),
+            (m, k) => {
+                log::warn!("failed to register low-level hooks: {m:?} {k:?}");
+                if let Ok(m) = m {
+                    let _ = UnhookWindowsHookEx(m);
+                }
+                if let Ok(k) = k {
+                    let _ = UnhookWindowsHookEx(k);
+                }
+                None
+            }
+        }
+    };
+    if let Some(new) = hooks {
+        if let Some(old) = HOOKS.replace(Some(new)) {
+            remove_hooks(old);
+        }
+    }
+}
+
+fn remove_hooks((mouse, kybrd): (HHOOK, HHOOK)) {
+    unsafe {
+        let _ = UnhookWindowsHookEx(mouse);
+        let _ = UnhookWindowsHookEx(kybrd);
+    }
 }
 
 fn get_msg() -> Option<MSG> {
@@ -169,14 +222,12 @@ fn start_routine(
         cnd.notify_one();
     }
 
-    let mouse_proc: HOOKPROC = Some(mouse_proc);
-    let kybrd_proc: HOOKPROC = Some(kybrd_proc);
     let window_proc: WNDPROC = Some(window_proc);
 
-    /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
+    /* register hooks and periodically refresh them (see HOOK_REFRESH_INTERVAL_MS) */
+    install_hooks();
+    if unsafe { SetTimer(None, 0, HOOK_REFRESH_INTERVAL_MS, None) } == 0 {
+        log::warn!("SetTimer failed: low-level hooks will not be refreshed");
     }
 
     let instance = unsafe { GetModuleHandleW(None).unwrap() };
@@ -224,12 +275,16 @@ fn start_routine(
     /* run message loop */
     while let Some(msg) = get_msg() {
         // mouse / keybrd proc do not actually return a message
-        if msg.hwnd.0.is_null() {
+        if msg.hwnd.0.is_null() && msg.message == WM_TIMER {
+            /* thread timer: refresh hooks in case Windows silently dropped them */
+            install_hooks();
+        } else if msg.hwnd.0.is_null() && msg.message == WM_USER {
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    REARM_AT.replace(Some(Instant::now() + REARM_DELAY));
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -255,6 +310,10 @@ fn start_routine(
             }
         }
     }
+
+    if let Some(hooks) = HOOKS.take() {
+        remove_hooks(hooks);
+    }
 }
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -274,6 +333,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
+    /* capture was released only just now (see REARM_DELAY) */
+    if REARM_AT.get().is_some_and(|t| Instant::now() < t) {
+        return ret;
+    }
+
     /* check if a client was activated */
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
@@ -289,20 +353,26 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
-    /* update active client and entry point */
-    ACTIVE_CLIENT.replace(Some(pos));
     let (entry_point, t) = DISPLAYS.with_borrow(|(displays, _)| {
         (
             display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos),
             display_util::cross_axis_position(displays, prev_pos, curr_pos, pos),
         )
     });
-    ENTRY_POINT.replace(entry_point);
 
-    /* notify main thread */
+    /* notify main thread. This runs inside the low-level hook, so it must
+     * never block: a blocked hook stalls all mouse input system-wide and
+     * gets the hook silently removed by Windows. If the consumer is
+     * lagging, simply don't activate — the next crossing will retry. */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin(t));
+    if let Err(e) = try_send_event(pos, CaptureEvent::Begin(t)) {
+        log::warn!("dropping barrier activation, event channel busy: {e}");
+        return ret;
+    }
+
+    /* update active client and entry point */
+    ACTIVE_CLIENT.replace(Some(pos));
+    ENTRY_POINT.replace(entry_point);
 
     ret
 }

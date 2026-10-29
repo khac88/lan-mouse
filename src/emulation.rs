@@ -9,7 +9,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -161,6 +161,10 @@ impl ListenTask {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        // peers whose cursor is currently on this device (sent `Enter`,
+        // not yet left), and when we last nudged a stale one to leave
+        let mut entered: HashSet<SocketAddr> = HashSet::new();
+        let mut leave_nudged: HashMap<SocketAddr, Instant> = HashMap::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -175,6 +179,7 @@ impl ListenTask {
                             ProtoEvent::Enter(pos, t) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
+                                    entered.insert(addr);
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
@@ -184,12 +189,29 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(..) => {
+                                entered.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 #[cfg(feature = "audio")]
                                 self.audio_sender.peer_left(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                // Input without a preceding `Enter`: the peer thinks
+                                // its cursor is here, but we've dropped that session
+                                // (e.g. it went unresponsive overnight and then came
+                                // back without re-sending `Enter`). There's no
+                                // barrier to hand the cursor back through, so the
+                                // peer could never get it back — tell it to leave.
+                                // The input is still consumed so key-ups aren't lost.
+                                if !entered.contains(&addr)
+                                    && leave_nudged.get(&addr).is_none_or(|i| i.elapsed() >= Duration::from_secs(1))
+                                {
+                                    log::warn!("{addr} sent input without entering, asking it to release");
+                                    leave_nudged.insert(addr, Instant::now());
+                                    self.listener.reply(addr, ProtoEvent::Leave(0, 0.5)).await;
+                                }
+                                self.emulation_proxy.consume(event, addr)
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -216,6 +238,7 @@ impl ListenTask {
                     }
                     Some(ListenEvent::Disconnected { addr }) => {
                         last_response.remove(&addr);
+                        entered.remove(&addr);
                         self.emulation_proxy.remove(addr);
                         #[cfg(feature = "audio")]
                         self.audio_sender.peer_disconnected(addr);
@@ -237,6 +260,7 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr, t) => {
+                        entered.remove(&addr);
                         #[cfg(feature = "audio")]
                         self.audio_sender.peer_left(addr);
                         self.listener.reply(addr, ProtoEvent::Leave(0, t)).await;
@@ -256,6 +280,7 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
+                            entered.remove(&addr);
                             self.emulation_proxy.remove(addr);
                             #[cfg(feature = "audio")]
                             self.audio_sender.peer_disconnected(addr);
