@@ -269,11 +269,12 @@ impl ClipboardManager {
             }
             ClipboardFormat::Png => match decode_png(&data) {
                 Ok((width, height, rgba)) => {
+                    let raw_hash = content_hash(ClipboardFormat::Png, &rgba);
                     let _ = self.cmd_tx.send(WorkerCmd::WriteImage {
                         width,
                         height,
                         rgba,
-                        hash,
+                        hash: raw_hash,
                     });
                 }
                 Err(e) => {
@@ -303,6 +304,7 @@ fn run_clipboard_worker(
     };
 
     let mut last_hash: Option<[u8; 32]> = None;
+    let mut suppress_echo_until = Instant::now();
 
     // Initialize with current clipboard content so we don't spam peers on startup
     if let Ok(text) = clipboard.get_text() {
@@ -319,6 +321,7 @@ fn run_clipboard_worker(
             match cmd {
                 WorkerCmd::WriteText(text, hash) => {
                     last_hash = Some(hash);
+                    suppress_echo_until = Instant::now() + Duration::from_millis(800);
                     if let Err(e) = clipboard.set_text(text) {
                         log::warn!("failed to set clipboard text: {e}");
                     } else {
@@ -332,6 +335,7 @@ fn run_clipboard_worker(
                     hash,
                 } => {
                     last_hash = Some(hash);
+                    suppress_echo_until = Instant::now() + Duration::from_millis(800);
                     let img_data = ImageData {
                         width: width as usize,
                         height: height as usize,
@@ -351,12 +355,16 @@ fn run_clipboard_worker(
             }
         }
 
+        let now = Instant::now();
+
         // Poll system clipboard for local changes
         if let Ok(text) = clipboard.get_text() {
             if !text.is_empty() {
                 let bytes = text.into_bytes();
                 let hash = content_hash(ClipboardFormat::Text, &bytes);
-                if last_hash != Some(hash) {
+                if now < suppress_echo_until {
+                    last_hash = Some(hash);
+                } else if last_hash != Some(hash) {
                     last_hash = Some(hash);
                     log::info!("clipboard: local text copied ({} bytes)", bytes.len());
                     let _ = out_tx.send(OutboundClipboard {
@@ -367,7 +375,9 @@ fn run_clipboard_worker(
             }
         } else if let Ok(img) = clipboard.get_image() {
             let raw_hash = content_hash(ClipboardFormat::Png, &img.bytes);
-            if last_hash != Some(raw_hash) {
+            if now < suppress_echo_until {
+                last_hash = Some(raw_hash);
+            } else if last_hash != Some(raw_hash) {
                 last_hash = Some(raw_hash);
                 match encode_png(img.width as u32, img.height as u32, &img.bytes) {
                     Ok(png_bytes) => {
