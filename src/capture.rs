@@ -9,11 +9,12 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use lan_mouse_proto::{ClipboardMsg, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
+use crate::clipboard::ClipboardManager;
 use crate::connect::LanMouseConnection;
 use crate::remap::KeyRemap;
 use crate::scroll::ScrollInvert;
@@ -68,12 +69,15 @@ enum CaptureRequest {
     SetRemap(Box<KeyRemap>),
     /// set the scroll axes inverted on their way to other devices
     SetScrollInvert(ScrollInvert),
-    #[cfg(feature = "audio")]
-    /// establish DTLS connection eagerly so incoming audio can arrive
+    /// establish DTLS connection eagerly so incoming audio or clipboard can arrive
     EnsureConnected(CaptureHandle),
     #[cfg(feature = "audio")]
     /// update audio playback configuration
     SetAudioConfig(crate::config::AudioConfig),
+    /// broadcast clipboard datagram to active peers
+    BroadcastClipboard(ClipboardMsg),
+    /// set clipboard manager
+    SetClipboard(Option<ClipboardManager>),
 }
 
 impl Capture {
@@ -168,7 +172,6 @@ impl Capture {
             .send(CaptureRequest::SetScrollInvert(scroll_invert));
     }
 
-    #[cfg(feature = "audio")]
     pub(crate) fn ensure_connected(&self, handle: CaptureHandle) {
         let _ = self
             .request_tx
@@ -178,6 +181,16 @@ impl Capture {
     #[cfg(feature = "audio")]
     pub(crate) fn set_audio_config(&self, audio: crate::config::AudioConfig) {
         let _ = self.request_tx.send(CaptureRequest::SetAudioConfig(audio));
+    }
+
+    pub(crate) fn broadcast_clipboard(&self, msg: ClipboardMsg) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::BroadcastClipboard(msg));
+    }
+
+    pub(crate) fn set_clipboard(&self, cb: Option<ClipboardManager>) {
+        let _ = self.request_tx.send(CaptureRequest::SetClipboard(cb));
     }
 }
 
@@ -266,13 +279,18 @@ impl CaptureTask {
                         CaptureRequest::SetScrollInvert(scroll_invert) => {
                             self.scroll_invert = scroll_invert
                         }
-                        #[cfg(feature = "audio")]
                         CaptureRequest::EnsureConnected(h) => {
                             self.conn.ensure_connected(h);
                         }
                         #[cfg(feature = "audio")]
                         CaptureRequest::SetAudioConfig(audio) => {
                             self.conn.set_audio_config(audio);
+                        }
+                        CaptureRequest::BroadcastClipboard(msg) => {
+                            self.conn.broadcast_clipboard(&msg).await;
+                        }
+                        CaptureRequest::SetClipboard(cb) => {
+                            self.conn.set_clipboard(cb);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -363,7 +381,6 @@ impl CaptureTask {
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
-                        #[cfg(feature = "audio")]
                         if t == CaptureType::Default {
                             self.conn.ensure_connected(h);
                         }
@@ -379,13 +396,18 @@ impl CaptureTask {
                     CaptureRequest::SetScrollInvert(scroll_invert) => {
                         self.scroll_invert = scroll_invert
                     }
-                    #[cfg(feature = "audio")]
                     CaptureRequest::EnsureConnected(h) => {
                         self.conn.ensure_connected(h);
                     }
                     #[cfg(feature = "audio")]
                     CaptureRequest::SetAudioConfig(audio) => {
                         self.conn.set_audio_config(audio);
+                    }
+                    CaptureRequest::BroadcastClipboard(msg) => {
+                        self.conn.broadcast_clipboard(&msg).await;
+                    }
+                    CaptureRequest::SetClipboard(cb) => {
+                        self.conn.set_clipboard(cb);
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

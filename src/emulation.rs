@@ -1,11 +1,12 @@
 #[cfg(feature = "audio")]
 use crate::audio::sender::AudioSender;
+use crate::clipboard::ClipboardManager;
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
+use lan_mouse_proto::{ClipboardMsg, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -76,6 +77,8 @@ enum EmulationRequest {
     ChangePort(u16),
     #[cfg(feature = "audio")]
     SetAudioConfig(crate::config::AudioConfig),
+    BroadcastClipboard(ClipboardMsg),
+    SetClipboard(Option<ClipboardManager>),
     Terminate,
 }
 
@@ -129,6 +132,16 @@ impl Emulation {
         let _ = self
             .request_tx
             .send(EmulationRequest::SetAudioConfig(audio));
+    }
+
+    pub(crate) fn broadcast_clipboard(&self, msg: ClipboardMsg) {
+        let _ = self
+            .request_tx
+            .send(EmulationRequest::BroadcastClipboard(msg));
+    }
+
+    pub(crate) fn set_clipboard(&self, cb: Option<ClipboardManager>) {
+        let _ = self.request_tx.send(EmulationRequest::SetClipboard(cb));
     }
 
     pub(crate) async fn event(&mut self) -> EmulationEvent {
@@ -273,6 +286,12 @@ impl ListenTask {
                     #[cfg(feature = "audio")]
                     EmulationRequest::SetAudioConfig(audio) => {
                         self.audio_sender.set_config(audio.send, audio.only_while_active);
+                    }
+                    EmulationRequest::BroadcastClipboard(msg) => {
+                        self.listener.broadcast_clipboard(&msg).await;
+                    }
+                    EmulationRequest::SetClipboard(cb) => {
+                        self.listener.set_clipboard(cb);
                     }
                     EmulationRequest::Terminate => break,
                 },

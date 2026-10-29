@@ -37,6 +37,9 @@ pub enum ProtocolError {
     /// audio datagram routed to fixed-size ProtoEvent decoder or malformed
     #[error("invalid audio frame: {0}")]
     InvalidAudioFrame(&'static str),
+    /// malformed clipboard transfer datagram
+    #[error("invalid clipboard message: {0}")]
+    InvalidClipboardMsg(&'static str),
 }
 
 /// Position of a client
@@ -138,6 +141,7 @@ pub enum EventType {
     Ack,
     Hello,
     Audio,
+    Clipboard,
 }
 
 impl ProtoEvent {
@@ -227,6 +231,9 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             }
             EventType::Audio => Err(ProtocolError::InvalidAudioFrame(
                 "audio datagrams must be decoded via AudioFrame::decode",
+            )),
+            EventType::Clipboard => Err(ProtocolError::InvalidClipboardMsg(
+                "clipboard datagrams must be decoded via ClipboardMsg::decode",
             )),
         }
     }
@@ -438,12 +445,133 @@ impl AudioFrame {
     }
 }
 
+/// Largest clipboard payload carried by a single [`ClipboardMsg::Chunk`].
+/// Together with the header and DTLS record overhead this keeps every
+/// datagram below a 1500 byte Ethernet MTU.
+pub const CLIPBOARD_CHUNK_SIZE: usize = 1024;
+
+/// Fixed header size of a [`ClipboardMsg::Chunk`] datagram:
+/// `tag (u8) + kind (u8) + id (u32) + index (u32) + total (u32) + format (u8)`.
+pub const CLIPBOARD_CHUNK_HEADER_SIZE: usize = 1 + 1 + 4 + 4 + 4 + 1;
+
+/// Format of a clipboard transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum ClipboardFormat {
+    /// UTF-8 text
+    Text,
+    /// PNG encoded image
+    Png,
+}
+
+/// Clipboard transfer datagram. A clipboard content is split into
+/// [`CLIPBOARD_CHUNK_SIZE`] chunks that are sent in order (go-back-N);
+/// the receiver acknowledges with the index of the next chunk it expects.
+///
+/// Wire layout (all integers big-endian):
+/// - `Chunk`: `[13][0][id u32][index u32][total u32][format u8][data ..]`
+/// - `Ack`  : `[13][1][id u32][next u32]`
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardMsg {
+    /// chunk `index` of `total` chunks of transfer `id`
+    Chunk {
+        id: u32,
+        index: u32,
+        total: u32,
+        format: ClipboardFormat,
+        data: Vec<u8>,
+    },
+    /// all chunks of transfer `id` before `next` were received
+    Ack { id: u32, next: u32 },
+}
+
+impl ClipboardMsg {
+    const KIND_CHUNK: u8 = 0;
+    const KIND_ACK: u8 = 1;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(EventType::Clipboard as u8);
+        match self {
+            ClipboardMsg::Chunk {
+                id,
+                index,
+                total,
+                format,
+                data,
+            } => {
+                out.reserve(CLIPBOARD_CHUNK_HEADER_SIZE + data.len());
+                out.push(Self::KIND_CHUNK);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&total.to_be_bytes());
+                out.push((*format).into());
+                out.extend_from_slice(data);
+            }
+            ClipboardMsg::Ack { id, next } => {
+                out.push(Self::KIND_ACK);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&next.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+        fn u32_at(buf: &[u8], at: usize) -> u32 {
+            u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"))
+        }
+        if buf.len() < 2 || buf[0] != EventType::Clipboard as u8 {
+            return Err(ProtocolError::InvalidClipboardMsg(
+                "not a clipboard datagram",
+            ));
+        }
+        match buf[1] {
+            Self::KIND_CHUNK => {
+                if buf.len() < CLIPBOARD_CHUNK_HEADER_SIZE {
+                    return Err(ProtocolError::InvalidClipboardMsg("short chunk header"));
+                }
+                let (id, index, total) = (u32_at(buf, 2), u32_at(buf, 6), u32_at(buf, 10));
+                let format = ClipboardFormat::try_from(buf[14])
+                    .map_err(|_| ProtocolError::InvalidClipboardMsg("unknown format"))?;
+                if index >= total {
+                    return Err(ProtocolError::InvalidClipboardMsg(
+                        "chunk index out of range",
+                    ));
+                }
+                let data = buf[CLIPBOARD_CHUNK_HEADER_SIZE..].to_vec();
+                if data.len() > CLIPBOARD_CHUNK_SIZE {
+                    return Err(ProtocolError::InvalidClipboardMsg("oversized chunk"));
+                }
+                Ok(ClipboardMsg::Chunk {
+                    id,
+                    index,
+                    total,
+                    format,
+                    data,
+                })
+            }
+            Self::KIND_ACK => {
+                if buf.len() < 10 {
+                    return Err(ProtocolError::InvalidClipboardMsg("short ack"));
+                }
+                Ok(ClipboardMsg::Ack {
+                    id: u32_at(buf, 2),
+                    next: u32_at(buf, 6),
+                })
+            }
+            _ => Err(ProtocolError::InvalidClipboardMsg("unknown kind")),
+        }
+    }
+}
+
 /// Top-level DTLS datagram dispatcher distinguishing fixed-size control/input
-/// events from variable-length audio frames.
+/// events from variable-length audio frames and clipboard transfers.
 #[derive(Clone, Debug)]
 pub enum Datagram {
     Event(ProtoEvent),
     Audio(AudioFrame),
+    Clipboard(ClipboardMsg),
 }
 
 impl Datagram {
@@ -453,6 +581,8 @@ impl Datagram {
         };
         if tag == EventType::Audio as u8 {
             AudioFrame::decode(buf).map(Self::Audio)
+        } else if tag == EventType::Clipboard as u8 {
+            ClipboardMsg::decode(buf).map(Self::Clipboard)
         } else {
             let mut event_buf = [0u8; MAX_EVENT_SIZE];
             let copy_len = buf.len().min(MAX_EVENT_SIZE);
@@ -465,6 +595,78 @@ impl Datagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_event_type_is_13() {
+        assert_eq!(EventType::Clipboard as u8, 13);
+    }
+
+    #[test]
+    fn clipboard_msgs_round_trip_through_datagram() {
+        let msgs = [
+            ClipboardMsg::Chunk {
+                id: 7,
+                index: 2,
+                total: 3,
+                format: ClipboardFormat::Png,
+                data: vec![1, 2, 3, 4],
+            },
+            ClipboardMsg::Chunk {
+                id: u32::MAX,
+                index: 0,
+                total: 1,
+                format: ClipboardFormat::Text,
+                data: vec![],
+            },
+            ClipboardMsg::Ack { id: 7, next: 3 },
+        ];
+        for msg in msgs {
+            match Datagram::decode(&msg.encode()).expect("valid") {
+                Datagram::Clipboard(m) => assert_eq!(m, msg),
+                other => panic!("misdecoded as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_clipboard_msgs_are_rejected() {
+        assert!(ClipboardMsg::decode(&[13]).is_err());
+        assert!(ClipboardMsg::decode(&[13, 9, 0, 0, 0, 0]).is_err());
+        assert!(ClipboardMsg::decode(&[13, 1, 0, 0, 0]).is_err());
+        // index >= total
+        let bad = ClipboardMsg::Chunk {
+            id: 1,
+            index: 0,
+            total: 1,
+            format: ClipboardFormat::Text,
+            data: vec![],
+        }
+        .encode();
+        let mut bad = bad;
+        bad[9] = 5;
+        assert!(ClipboardMsg::decode(&bad).is_err());
+        // unknown format
+        let mut fmt = ClipboardMsg::Chunk {
+            id: 1,
+            index: 0,
+            total: 1,
+            format: ClipboardFormat::Text,
+            data: vec![],
+        }
+        .encode();
+        fmt[14] = 42;
+        assert!(ClipboardMsg::decode(&fmt).is_err());
+        // oversized chunk
+        let big = ClipboardMsg::Chunk {
+            id: 1,
+            index: 0,
+            total: 1,
+            format: ClipboardFormat::Text,
+            data: vec![0; CLIPBOARD_CHUNK_SIZE + 1],
+        }
+        .encode();
+        assert!(ClipboardMsg::decode(&big).is_err());
+    }
 
     #[test]
     fn audio_event_type_is_12() {
@@ -555,7 +757,7 @@ mod tests {
         let audio_wire = audio.encode();
         match Datagram::decode(&audio_wire).expect("datagram decode") {
             Datagram::Audio(decoded) => assert_eq!(decoded, audio),
-            Datagram::Event(ev) => panic!("audio packet misdecoded as ProtoEvent: {ev}"),
+            other => panic!("audio packet misdecoded: {other:?}"),
         }
 
         let mut fixed = [0u8; MAX_EVENT_SIZE];
@@ -584,7 +786,7 @@ mod tests {
             assert!(AudioFrame::decode(slice).is_err());
             match Datagram::decode(slice).expect("proto event decode") {
                 Datagram::Event(decoded) => assert_eq!(format!("{decoded}"), format!("{ev}")),
-                Datagram::Audio(_) => panic!("ProtoEvent misdecoded as AudioFrame"),
+                other => panic!("ProtoEvent misdecoded: {other:?}"),
             }
         }
 

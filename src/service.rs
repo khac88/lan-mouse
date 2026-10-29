@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{ClipboardManager, OutboundClipboard},
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -23,7 +24,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{process::Command, signal, sync::Notify, sync::mpsc::UnboundedReceiver};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -69,6 +70,10 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// clipboard manager handle
+    clipboard: Option<ClipboardManager>,
+    /// receiver for locally copied clipboard items
+    outbound_clipboard_rx: Option<UnboundedReceiver<OutboundClipboard>>,
 }
 
 #[derive(Debug)]
@@ -133,6 +138,17 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        let clipboard_config = config.clipboard();
+        let (clipboard, outbound_clipboard_rx) = if clipboard_config.enabled {
+            log::info!("clipboard sync enabled");
+            let (mgr, rx) = ClipboardManager::new();
+            (Some(mgr), Some(rx))
+        } else {
+            (None, None)
+        };
+        capture.set_clipboard(clipboard.clone());
+        emulation.set_clipboard(clipboard.clone());
+
         let port = config.port();
         let service = Self {
             config,
@@ -151,6 +167,8 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard,
+            outbound_clipboard_rx,
         };
         Ok(service)
     }
@@ -175,6 +193,17 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                item = async {
+                    if let Some(rx) = &mut self.outbound_clipboard_rx {
+                        rx.recv().await
+                    } else {
+                        futures::future::pending().await
+                    }
+                } => {
+                    if let Some(item) = item {
+                        self.handle_outbound_clipboard(item).await;
+                    }
+                }
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -303,12 +332,46 @@ impl Service {
                 "[audio] is enabled in config, but lan-mouse was built without the `audio` feature; ignoring"
             );
         }
+        let clipboard_config = self.config.clipboard();
+        if clipboard_config.enabled && self.clipboard.is_none() {
+            let (mgr, rx) = ClipboardManager::new();
+            self.capture.set_clipboard(Some(mgr.clone()));
+            self.emulation.set_clipboard(Some(mgr.clone()));
+            self.clipboard = Some(mgr);
+            self.outbound_clipboard_rx = Some(rx);
+            log::info!("clipboard sync enabled");
+        } else if !clipboard_config.enabled && self.clipboard.is_some() {
+            self.capture.set_clipboard(None);
+            self.emulation.set_clipboard(None);
+            self.clipboard = None;
+            self.outbound_clipboard_rx = None;
+            log::info!("clipboard sync disabled");
+        }
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
         self.sync_frontend();
+    }
+
+    async fn handle_outbound_clipboard(&mut self, item: OutboundClipboard) {
+        let Some(cb) = &self.clipboard else { return };
+        let id = cb.next_transfer_id();
+        let chunks = crate::clipboard::chunk_payload(id, item.format, &item.data);
+        log::info!(
+            "clipboard: broadcasting {:?} ({} bytes, {} chunks)",
+            item.format,
+            item.data.len(),
+            chunks.len()
+        );
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            self.capture.broadcast_clipboard(chunk.clone());
+            self.emulation.broadcast_clipboard(chunk);
+            if i % 32 == 31 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     async fn handle_frontend_pending(&mut self) {
@@ -415,7 +478,6 @@ impl Service {
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
-                #[cfg(feature = "audio")]
                 if self
                     .client_manager
                     .get_state(handle)

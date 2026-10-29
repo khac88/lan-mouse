@@ -488,6 +488,17 @@ invert_scroll_horizontal = false
 Like `remap_keys`, this happens on the *sending* side only, so scrolling on
 the local machine itself is unaffected.
 
+### Clipboard Synchronization
+
+Bidirectional clipboard synchronization of UTF-8 text and PNG images can be enabled via:
+
+```toml
+[clipboard]
+enabled = true
+```
+
+Whenever text or an image is copied locally (via Ctrl+C, Cmd+C, or context menu), it is split into DTLS datagram chunks, sent to connected devices, and written to their local OS clipboard with echo suppression.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.
@@ -502,7 +513,7 @@ the local machine itself is unaffected.
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard support (text and images)
 
 
 ## Detailed OS Support

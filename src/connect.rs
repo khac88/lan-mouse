@@ -1,11 +1,12 @@
 #[cfg(feature = "audio")]
 use crate::audio::playback::AudioPlayer;
 use crate::client::ClientManager;
+use crate::clipboard::ClipboardManager;
 #[cfg(feature = "audio")]
 use crate::config::AudioConfig;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{ClipboardMsg, Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -46,15 +47,12 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(feature = "audio")]
-const AUDIO_RECONNECT_BASE_SECS: u64 = 2;
-#[cfg(feature = "audio")]
-const AUDIO_RECONNECT_MAX_SECS: u64 = 15;
+const RECONNECT_BASE_SECS: u64 = 2;
+const RECONNECT_MAX_SECS: u64 = 15;
 
-#[cfg(feature = "audio")]
 fn reconnect_backoff(attempt: u32) -> Duration {
     let shift = attempt.min(3);
-    let secs = (AUDIO_RECONNECT_BASE_SECS << shift).min(AUDIO_RECONNECT_MAX_SECS);
+    let secs = (RECONNECT_BASE_SECS << shift).min(RECONNECT_MAX_SECS);
     Duration::from_secs(secs)
 }
 
@@ -125,6 +123,7 @@ pub(crate) struct LanMouseConnection {
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
     #[cfg(feature = "audio")]
     audio_player: Rc<RefCell<Option<AudioPlayer>>>,
 }
@@ -150,8 +149,28 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
+            clipboard: Default::default(),
             #[cfg(feature = "audio")]
             audio_player: Rc::new(RefCell::new(player)),
+        }
+    }
+
+    pub(crate) fn set_clipboard(&self, clipboard: Option<ClipboardManager>) {
+        let was_none = self.clipboard.borrow().is_none();
+        let is_some = clipboard.is_some();
+        *self.clipboard.borrow_mut() = clipboard;
+        if was_none && is_some {
+            for handle in self.client_manager.active_clients() {
+                self.ensure_connected(handle);
+            }
+        }
+    }
+
+    pub(crate) async fn broadcast_clipboard(&self, msg: &ClipboardMsg) {
+        let buf = msg.encode();
+        let conns = self.conns.lock().await;
+        for conn in conns.values() {
+            let _ = conn.send(&buf).await;
         }
     }
 
@@ -186,12 +205,16 @@ impl LanMouseConnection {
         }
     }
 
-    #[cfg(feature = "audio")]
     pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
-        if self.audio_player.borrow().is_none() {
+        #[cfg(feature = "audio")]
+        let has_audio = self.audio_player.borrow().is_some();
+        #[cfg(not(feature = "audio"))]
+        let has_audio = false;
+
+        if !has_audio && self.clipboard.borrow().is_none() {
             return;
         }
-        spawn_audio_connect(
+        spawn_eager_connect(
             self.client_manager.clone(),
             self.cert.clone(),
             handle,
@@ -199,6 +222,8 @@ impl LanMouseConnection {
             self.connecting.clone(),
             self.recv_tx.clone(),
             self.ping_response.clone(),
+            self.clipboard.clone(),
+            #[cfg(feature = "audio")]
             self.audio_player.clone(),
             Duration::ZERO,
             0,
@@ -246,6 +271,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                self.clipboard.clone(),
                 #[cfg(feature = "audio")]
                 self.audio_player.clone(),
                 0,
@@ -255,9 +281,8 @@ impl LanMouseConnection {
     }
 }
 
-#[cfg(feature = "audio")]
 #[allow(clippy::too_many_arguments)]
-fn spawn_audio_connect(
+fn spawn_eager_connect(
     client_manager: ClientManager,
     cert: Certificate,
     handle: ClientHandle,
@@ -265,7 +290,8 @@ fn spawn_audio_connect(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    audio_player: Rc<RefCell<Option<AudioPlayer>>>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
+    #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
     delay: Duration,
     attempt: u32,
 ) {
@@ -273,7 +299,12 @@ fn spawn_audio_connect(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        if audio_player.borrow().is_none() {
+        #[cfg(feature = "audio")]
+        let has_audio = audio_player.borrow().is_some();
+        #[cfg(not(feature = "audio"))]
+        let has_audio = false;
+
+        if !has_audio && clipboard.borrow().is_none() {
             return;
         }
         if !client_manager
@@ -302,6 +333,8 @@ fn spawn_audio_connect(
             connecting,
             tx,
             ping_response,
+            clipboard,
+            #[cfg(feature = "audio")]
             audio_player,
             attempt,
         )
@@ -318,6 +351,7 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
     #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
     attempt: u32,
 ) -> Result<(), LanMouseConnectionError> {
@@ -349,9 +383,13 @@ async fn connect_to_handle(
             Err(e) => {
                 connecting.lock().await.remove(&handle);
                 #[cfg(feature = "audio")]
-                if audio_player.borrow().is_some() {
+                let eager_needed = audio_player.borrow().is_some() || clipboard.borrow().is_some();
+                #[cfg(not(feature = "audio"))]
+                let eager_needed = clipboard.borrow().is_some();
+
+                if eager_needed {
                     let next_attempt = attempt.saturating_add(1);
-                    spawn_audio_connect(
+                    spawn_eager_connect(
                         client_manager,
                         cert,
                         handle,
@@ -359,6 +397,8 @@ async fn connect_to_handle(
                         connecting,
                         tx,
                         ping_response,
+                        clipboard,
+                        #[cfg(feature = "audio")]
                         audio_player,
                         reconnect_backoff(attempt),
                         next_attempt,
@@ -391,16 +431,15 @@ async fn connect_to_handle(
         // receiver
         spawn_local(receive_loop(
             client_manager,
-            #[cfg(feature = "audio")]
             cert,
             handle,
             addr,
             conn,
             conns,
-            #[cfg(feature = "audio")]
             connecting,
             tx,
             ping_response.clone(),
+            clipboard,
             #[cfg(feature = "audio")]
             audio_player,
         ));
@@ -441,14 +480,15 @@ async fn ping_pong(
 #[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
-    #[cfg(feature = "audio")] cert: Certificate,
+    cert: Certificate,
     handle: ClientHandle,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    #[cfg(feature = "audio")] connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
     #[cfg(feature = "audio")] audio_player: Rc<RefCell<Option<AudioPlayer>>>,
 ) {
     let mut buf = [0u8; MAX_DATAGRAM_SIZE];
@@ -486,6 +526,12 @@ async fn receive_loop(
                     );
                 }
             }
+            Ok(Datagram::Clipboard(msg)) => {
+                log::trace!("received clipboard datagram on connect side from {addr}");
+                if let Some(ref cb) = *clipboard.borrow() {
+                    cb.handle_incoming(msg);
+                }
+            }
             // Skip undecodable datagrams without dropping the
             // connection. Each DTLS recv is one framed message, so
             // skipping is safe and keeps us forward-compatible with
@@ -496,8 +542,12 @@ async fn receive_loop(
     log::warn!("recv error");
     disconnect(&client_manager, handle, addr, &conns).await;
     #[cfg(feature = "audio")]
-    if audio_player.borrow().is_some() {
-        spawn_audio_connect(
+    let eager_needed = audio_player.borrow().is_some() || clipboard.borrow().is_some();
+    #[cfg(not(feature = "audio"))]
+    let eager_needed = clipboard.borrow().is_some();
+
+    if eager_needed {
+        spawn_eager_connect(
             client_manager,
             cert,
             handle,
@@ -505,6 +555,8 @@ async fn receive_loop(
             connecting,
             tx,
             ping_response,
+            clipboard,
+            #[cfg(feature = "audio")]
             audio_player,
             reconnect_backoff(0),
             1,

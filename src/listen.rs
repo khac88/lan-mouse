@@ -1,8 +1,9 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{ClipboardMsg, Datagram, MAX_DATAGRAM_SIZE, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     rc::Rc,
@@ -22,6 +23,7 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
+use crate::clipboard::ClipboardManager;
 use crate::crypto;
 
 #[derive(Error, Debug)]
@@ -75,6 +77,7 @@ pub(crate) struct LanMouseListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -134,8 +137,10 @@ impl LanMouseListener {
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
+        let clipboard: Rc<RefCell<Option<ClipboardManager>>> = Default::default();
 
         let conns_clone = conns.clone();
+        let clipboard_clone = clipboard.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
@@ -155,7 +160,13 @@ impl LanMouseListener {
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
+                                spawn_local(read_loop(
+                                    conns_clone.clone(),
+                                    addr,
+                                    conn,
+                                    listen_tx.clone(),
+                                    clipboard_clone.clone(),
+                                ));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -203,7 +214,20 @@ impl LanMouseListener {
             listen_task,
             port_changed,
             request_port_change,
+            clipboard,
         })
+    }
+
+    pub(crate) fn set_clipboard(&self, clipboard: Option<ClipboardManager>) {
+        *self.clipboard.borrow_mut() = clipboard;
+    }
+
+    pub(crate) async fn broadcast_clipboard(&self, msg: &ClipboardMsg) {
+        let buf = msg.encode();
+        let conns = self.conns.lock().await;
+        for (_, conn) in conns.iter() {
+            let _ = conn.send(&buf).await;
+        }
     }
 
     pub(crate) fn request_port_change(&mut self, port: u16) {
@@ -275,6 +299,7 @@ async fn read_loop(
     addr: SocketAddr,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
+    clipboard: Rc<RefCell<Option<ClipboardManager>>>,
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_DATAGRAM_SIZE];
 
@@ -288,6 +313,12 @@ async fn read_loop(
                     "ignoring audio datagram on listen side from {addr} (seq={})",
                     frame.seq
                 );
+            }
+            Ok(Datagram::Clipboard(msg)) => {
+                log::trace!("received clipboard datagram on listen side from {addr}");
+                if let Some(ref cb) = *clipboard.borrow() {
+                    cb.handle_incoming(msg);
+                }
             }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep

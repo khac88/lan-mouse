@@ -178,7 +178,7 @@ impl InputCaptureState {
     /// position `t`, e.g. so a peer handing control back can place the
     /// cursor at the spot matching where its own local crossing was.
     fn release_point(&self, t: f64) -> Option<CGPoint> {
-        let edge_offset = 1.0;
+        let edge_offset = 12.0;
         Some(match self.current_pos? {
             Position::Left => CGPoint::new(
                 self.bounds.xmin + edge_offset,

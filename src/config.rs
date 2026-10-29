@@ -75,6 +75,14 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     audio: Option<AudioConfig>,
+    clipboard: Option<ClipboardConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClipboardConfig {
+    /// synchronize clipboard text and images across connected devices
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_only_while_active() -> bool {
@@ -601,6 +609,14 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// clipboard synchronization configuration
+    pub fn clipboard(&self) -> ClipboardConfig {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard)
+            .unwrap_or_default()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -773,5 +789,19 @@ port = 4242
                 buffer_ms: 30,
             }
         );
+    }
+
+    #[test]
+    fn clipboard_config_round_trip_and_defaults() {
+        let raw = r#"
+[clipboard]
+enabled = true
+"#;
+        let cfg = round_trip_via_write_back(raw);
+        assert_eq!(cfg.clipboard, Some(ClipboardConfig { enabled: true }));
+
+        let empty = round_trip_via_write_back("port = 4242\n");
+        assert_eq!(empty.clipboard, None);
+        assert!(!empty.clipboard.unwrap_or_default().enabled);
     }
 }
