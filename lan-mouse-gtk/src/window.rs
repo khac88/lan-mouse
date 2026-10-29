@@ -59,6 +59,44 @@ impl Window {
             .expect("Could not get clients")
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn client_list_store(&self) -> Option<gio::ListStore> {
+        self.imp().clients.borrow().clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn authorized_list_store(&self) -> Option<gio::ListStore> {
+        self.imp().authorized.borrow().clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn client_by_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
+        let store = self.client_list_store()?;
+        for i in 0..store.n_items() {
+            if let Some(obj) = store.item(i).and_downcast::<ClientObject>() {
+                if obj.handle() == handle {
+                    return Some(obj);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn public_key_fingerprint(&self) -> Option<String> {
+        self.imp().fingerprint_row.subtitle().map(|s| s.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn local_port(&self) -> u16 {
+        self.imp().port.get()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn send_frontend_request(&self, request: FrontendRequest) {
+        self.request(request);
+    }
+
     fn authorized(&self) -> gio::ListStore {
         self.imp()
             .authorized
@@ -323,6 +361,11 @@ impl Window {
         self.clients().append(&client);
         self.update_placeholder_visibility();
         self.update_dns_state(handle, !state.ips.is_empty());
+        #[cfg(target_os = "macos")]
+        if let Some(host) = crate::macos_status_item::take_pending_client_hostname() {
+            self.request(FrontendRequest::UpdateHostname(handle, Some(host)));
+            self.request(FrontendRequest::ResolveDns(handle));
+        }
     }
 
     pub(super) fn update_client_list(

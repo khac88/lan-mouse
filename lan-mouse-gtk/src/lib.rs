@@ -247,7 +247,6 @@ fn build_ui(app: &Application) {
         macos_privacy::watch_accessibility_state(move |change| match change {
             macos_privacy::AccessibilityChange::Granted => {
                 if let Some(window) = window_weak.upgrade() {
-                    window.present();
                     window.refresh_capture_emulation_status();
                 }
             }
@@ -310,15 +309,12 @@ fn build_ui(app: &Application) {
     #[cfg(not(target_os = "macos"))]
     window.present();
 
-    // On macOS, default to presenting the main window on every launch
-    // so the user gets a visible confirmation that the app is running
-    // — including the post-grant relaunch and normal Dock/Finder/`open`
-    // launches. Opt out by setting `LAN_MOUSE_HIDDEN=1` in the
-    // environment (useful for a LaunchAgent / login-item configuration
-    // where the user wants the app to come up quietly into the menu
-    // bar only, with no window on boot).
+    // On macOS, Lan Mouse lives in the top bar menu. The main
+    // configuration window is hidden by default and accessible via
+    // the status menu ("Open Configuration Window...") or by setting
+    // LAN_MOUSE_SHOW_WINDOW=1.
     #[cfg(target_os = "macos")]
-    if env::var_os("LAN_MOUSE_HIDDEN").is_none() {
+    if env::var_os("LAN_MOUSE_SHOW_WINDOW").is_some() {
         window.present();
     }
 }

@@ -174,12 +174,14 @@ impl ClientRow {
     }
 
     fn handle_sync_sound_switch(&self, state: bool, _switch: &Switch) -> bool {
-        self.obj().emit_by_name::<()>("request-sync-sound", &[&state]);
+        self.obj()
+            .emit_by_name::<()>("request-sync-sound", &[&state]);
         true
     }
 
     fn handle_sync_clipboard_switch(&self, state: bool, _switch: &Switch) -> bool {
-        self.obj().emit_by_name::<()>("request-sync-clipboard", &[&state]);
+        self.obj()
+            .emit_by_name::<()>("request-sync-clipboard", &[&state]);
         true
     }
 

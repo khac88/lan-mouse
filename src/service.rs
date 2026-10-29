@@ -707,7 +707,8 @@ impl Service {
     }
 
     fn update_sync_clipboard(&mut self, handle: ClientHandle, sync_clipboard: bool) {
-        self.client_manager.set_sync_clipboard(handle, sync_clipboard);
+        self.client_manager
+            .set_sync_clipboard(handle, sync_clipboard);
         self.broadcast_client(handle);
     }
 
