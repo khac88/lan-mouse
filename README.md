@@ -15,7 +15,13 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 
 ***blazingly fast™*** because it's written in rust.
 
-- _Now with a gtk frontend_
+> [!TIP]
+> **Fork Highlights & Enhancements:**
+> - 🔊 **Sync Sound:** Seamless, driverless real-time audio streaming from remote clients (e.g. Windows PC) to your local speakers (WASAPI loopback $\rightarrow$ CoreAudio/cpal), automatically streaming only while the mouse is active on that machine.
+> - 📋 **Sync Clipboard:** Real-time bidirectional text and PNG image clipboard synchronization with 0% idle CPU overhead using OS sequence numbers (`NSPasteboard.changeCount` and `GetClipboardSequenceNumber`).
+> - ⌨️ **Key & Chord Remapping:** Physical key swaps (`remap_keys`) and context-aware chord overrides (`remap_chords`, e.g. `Cmd+Tab` $\rightarrow$ `Alt+Tab` while `Cmd+C` stays `Ctrl+C`), plus natural scroll direction inversion.
+> - 🍏 **All-in-One macOS Native Menu Bar:** Standalone configuration window eliminated on macOS in favor of a fast, native status bar menu with live connection indicators, per-client toggles, and edge position controls.
+> - ⚡ **Zero-Latency Ghost Cursor Fix:** Instant CoreGraphics cursor capture and balanced cursor visibility tracking, eliminating cursor lingering or ghosting across screens.
 
 <picture>
     <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
@@ -105,8 +111,8 @@ dnf install lan-mouse
 - Unzip it
 - Remove the quarantine with `xattr -rd com.apple.quarantine "Lan Mouse.app"`
 - Launch the app
-- Use the menu bar item to open the settings window or quit Lan Mouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
-- Grant accessibility permissions in System Preferences
+- Lan Mouse on macOS runs 100% as a streamlined menu bar application (no Dock icon, no extra windows). Click the menu bar icon (`LM`) to manage connections, toggle active status, enable/disable Sound and Clipboard sync, switch edge positions, and view connection states.
+- Grant Accessibility and Input Monitoring permissions in macOS System Settings when prompted.
 
 </details>
 
@@ -321,6 +327,18 @@ If the device still can not be entered, make sure you have UDP port `4242` (or t
 </details>
 
 <details>
+    <summary>macOS Native Menu Bar</summary>
+
+On macOS, Lan Mouse integrates directly into your system top menu bar (`LM` icon):
+- **Single-Click Controls:** View local hostname and port, and click to copy certificate fingerprint.
+- **Connection Status:** Shows real-time connection state (`● Connected`, `○ Disconnected`) for all peers.
+- **Per-Client Controls:** Toggle `Active`, `Sync Sound`, and `Sync Clipboard` directly with instant feedback.
+- **Dynamic Screen Edges:** Change edge position (`Top`, `Right`, `Bottom`, `Left`) on the fly from a submenu.
+- **Connection Management:** Add or delete clients with native dialogs.
+- **No Window Clutter:** Runs as a menu bar accessory (LSUIElement) with zero Dock icons or floating windows; settings persist to `config.toml`.
+</details>
+
+<details>
     <summary>Command Line Interface</summary>
 
 The cli interface can be accessed by passing `cli` as a commandline argument.
@@ -400,6 +418,10 @@ hostname = "iridium"
 activate_on_startup = true
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
+# enable audio streaming to/from this client (default: true)
+sync_sound = true
+# enable clipboard synchronization with this client (default: true)
+sync_clipboard = true
 
 # define a client on the left side with IP address 192.168.178.189
 [[clients]]
@@ -411,6 +433,19 @@ hostname = "thorium"
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
 port = 4242
+sync_sound = true
+sync_clipboard = true
+
+# audio streaming configuration (optional)
+[audio]
+send = false              # sender side: capture system loopback audio and stream out
+receive = false           # receiver side: play incoming audio stream
+only_while_active = true  # stream audio only while cursor is active on the peer
+buffer_ms = 30            # receiver jitter buffer target latency in milliseconds
+
+# clipboard synchronization configuration (optional)
+[clipboard]
+enabled = true            # enable bidirectional text & PNG image clipboard sharing
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
@@ -488,32 +523,64 @@ invert_scroll_horizontal = false
 Like `remap_keys`, this happens on the *sending* side only, so scrolling on
 the local machine itself is unaffected.
 
-### Clipboard Synchronization
+### Audio Streaming (Sync Sound)
 
-Bidirectional clipboard synchronization of UTF-8 text and PNG images can be enabled via:
+Stream system audio from a remote host (e.g. Windows PC) to your local speakers (e.g. Mac or Linux) over the existing authenticated DTLS connection—**no virtual audio drivers or cables needed**:
+
+- **Driverless WASAPI Loopback (Windows):** Captures the default audio output endpoint, downmixes to 48 kHz stereo 16-bit PCM, and transmits 5ms datagrams over DTLS.
+- **Low-Latency Adaptive Playback (Mac / Linux):** Dynamic jitter buffer (default 30ms latency) with linear resampling and smooth fade-in/out ramps to prevent audio clicks and stutter.
+- **Cursor-Gated Routing (`only_while_active = true`):** Audio streams seamlessly while your mouse cursor is on the remote machine and automatically pauses when you move the cursor back to the host.
+- **Per-Client Control:** Toggle `Sync Sound` per connection directly in the GTK connection card or the macOS status bar menu.
+
+```toml
+[audio]
+send = false              # Windows listen side: capture WASAPI loopback and send
+receive = false           # Connect side (e.g. macOS): play incoming audio packets
+only_while_active = true  # Stream only while the remote cursor is inside this machine
+buffer_ms = 30            # Receiver jitter buffer target latency in milliseconds
+```
+
+### Clipboard Synchronization (Sync Clipboard)
+
+Bidirectional clipboard synchronization of UTF-8 text and PNG images across local network devices:
 
 ```toml
 [clipboard]
 enabled = true
 ```
 
-Whenever text or an image is copied locally (via Ctrl+C, Cmd+C, or context menu), it is split into DTLS datagram chunks, sent to connected devices, and written to their local OS clipboard with echo suppression.
+- **Zero-CPU Polling:** Checks OS sequence counters (`NSPasteboard.changeCount` on macOS, `GetClipboardSequenceNumber` on Windows) before reading data. When no new copy occurs, idle CPU usage stays at 0.00%.
+- **Instant Response:** Rapid 150ms change polling gives near-instantaneous copy-paste response.
+- **Rich Media & Chunking:** Supports text and images up to 16 MB with automatic datagram chunking and SHA-256 echo suppression.
+- **Per-Client Control:** Toggle `Sync Clipboard` per connection in the GTK connection card or the macOS menu bar.
+
+### All-in-One macOS Native Menu Bar App
+
+On macOS, the standalone configuration window has been completely replaced by an integrated, native status bar menu (`LM` in the top bar):
+- **Live State:** Connection status badges (`● Connected`, `○ Disconnected`) for each client.
+- **Inline Toggles:** One-click checkboxes for `Active`, `Sync Sound`, and `Sync Clipboard`.
+- **Dynamic Edges:** Submenu to change screen positions (`Top`, `Right`, `Bottom`, `Left`) on the fly.
+- **Zero Dock Clutter:** Runs as an accessory (`LSUIElement`) with 0ms ghost-free cursor transitions.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
-- [x] respect xdg-config-home for config file location.
+- [x] Respect xdg-config-home for config file location
 - [x] IP Address switching
-- [x] Liveness tracking Automatically ungrab mouse when client unreachable
-- [x] Liveness tracking: Automatically release keys, when server offline
+- [x] Liveness tracking: Automatically ungrab mouse when client unreachable
+- [x] Liveness tracking: Automatically release keys when server offline
 - [x] MacOS KeyCode Translation
 - [x] Libei Input Capture
-- [x] MacOS Input Capture
+- [x] MacOS Input Capture (with zero-latency synchronous cursor hiding)
 - [x] Windows Input Capture
-- [x] Encryption
+- [x] Encryption via DTLS
+- [x] Key remapping (`remap_keys`) and context-aware chords (`remap_chords`)
+- [x] Scroll direction inversion (`invert_scroll_vertical`, `invert_scroll_horizontal`)
+- [x] Real-time audio streaming (WASAPI loopback $\rightarrow$ CoreAudio / cpal)
+- [x] Bidirectional clipboard synchronization (text & PNG images with zero-CPU OS sequence polling)
+- [x] Consolidated macOS native status bar menu interface
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [x] Clipboard support (text and images)
 
 
 ## Detailed OS Support
