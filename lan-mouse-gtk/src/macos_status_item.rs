@@ -263,11 +263,7 @@ unsafe fn rebuild_menu(menu: Id, window: &Window, delegate: Id) {
 
     msg_send_void_id(menu, sel(c"addItem:"), separator_item());
 
-    // 7. Settings Window (Fallback) & Quit
-    let settings_item = menu_item(c"Open Configuration Window...", c"showLanMouse:");
-    msg_send_void_id(settings_item, sel(c"setTarget:"), delegate);
-    msg_send_void_id(menu, sel(c"addItem:"), settings_item);
-
+    // 7. Quit
     let quit_item = menu_item(c"Quit Lan Mouse", c"quitLanMouse:");
     msg_send_void_id(quit_item, sel(c"setTarget:"), delegate);
     msg_send_void_id(menu, sel(c"addItem:"), quit_item);
@@ -473,12 +469,6 @@ fn delegate_class() -> Class {
         let class = objc_allocateClassPair(superclass, class_name.as_ptr(), 0);
         assert!(!class.is_null(), "failed to allocate status item delegate");
 
-        class_addMethod(
-            class,
-            sel(c"showLanMouse:"),
-            show_lan_mouse as *const c_void,
-            c"v@:@".as_ptr(),
-        );
         class_addMethod(
             class,
             sel(c"quitLanMouse:"),
@@ -763,30 +753,8 @@ extern "C" fn open_privacy_settings(_this: Id, _cmd: Sel, _sender: Id) {
     crate::macos_privacy::open_accessibility_settings();
 }
 
-extern "C" fn show_lan_mouse(_this: Id, _cmd: Sel, _sender: Id) {
-    present_window();
-}
-
 extern "C" fn handle_reopen_event(_this: Id, _cmd: Sel, _event: Id, _reply: Id) {
-    log::debug!("kAEReopenApplication received — presenting main window");
-    present_window();
-}
-
-fn present_window() {
-    STATUS_ITEM.with(|item| {
-        let item = item.borrow();
-        let Some(item) = item.as_ref() else {
-            return;
-        };
-        if let Some(window) = item.window.upgrade() {
-            window.present();
-        }
-
-        unsafe {
-            let ns_app = msg_send_id(class(c"NSApplication"), sel(c"sharedApplication"));
-            msg_send_void_bool(ns_app, sel(c"activateIgnoringOtherApps:"), 1);
-        }
-    });
+    log::debug!("kAEReopenApplication received");
 }
 
 // Register the status-item delegate as the handler for the

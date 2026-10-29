@@ -308,13 +308,4 @@ fn build_ui(app: &Application) {
 
     #[cfg(not(target_os = "macos"))]
     window.present();
-
-    // On macOS, Lan Mouse lives in the top bar menu. The main
-    // configuration window is hidden by default and accessible via
-    // the status menu ("Open Configuration Window...") or by setting
-    // LAN_MOUSE_SHOW_WINDOW=1.
-    #[cfg(target_os = "macos")]
-    if env::var_os("LAN_MOUSE_SHOW_WINDOW").is_some() {
-        window.present();
-    }
 }
