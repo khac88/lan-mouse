@@ -76,17 +76,11 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    cursor_hidden: bool,
 }
 
 #[derive(Debug)]
 enum ProducerEvent {
-    Release,
-    /// release, first warping the cursor to normalized cross-axis
-    /// position `t` along the edge currently captured at
-    ReleaseTo(f64),
-    Create(Position),
-    Destroy(Position),
-    Grab(Position),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -99,6 +93,7 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            cursor_hidden: false,
         };
         res.update_bounds()?;
         Ok(res)
@@ -163,7 +158,9 @@ impl InputCaptureState {
             Position::Bottom => location.y = self.bounds.ymax - edge_offset,
         };
         self.enter_position = Some(location);
-        self.reset_cursor()?;
+        let _ = self.hide_cursor();
+        let _ = self.reset_cursor();
+        self.current_pos = Some(position);
         Ok(t)
     }
 
@@ -199,12 +196,20 @@ impl InputCaptureState {
         })
     }
 
-    fn hide_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn hide_cursor(&mut self) -> Result<(), CaptureError> {
+        if !self.cursor_hidden {
+            self.cursor_hidden = true;
+            CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)?;
+        }
+        Ok(())
     }
 
-    fn show_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn show_cursor(&mut self) -> Result<(), CaptureError> {
+        if self.cursor_hidden {
+            self.cursor_hidden = false;
+            CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)?;
+        }
+        Ok(())
     }
 
     async fn handle_producer_event(
@@ -213,40 +218,6 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
-            ProducerEvent::Release => {
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
-            }
-            ProducerEvent::ReleaseTo(t) => {
-                if self.current_pos.is_some() {
-                    if let Some(point) = self.release_point(t) {
-                        CGDisplay::warp_mouse_cursor_position(point)
-                            .map_err(CaptureError::WarpCursor)?;
-                    }
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
-            }
-            ProducerEvent::Grab(pos) => {
-                if self.current_pos.is_none() {
-                    self.hide_cursor()?;
-                    self.current_pos = Some(pos);
-                }
-            }
-            ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
-            }
-            ProducerEvent::Destroy(p) => {
-                if let Some(current) = self.current_pos {
-                    if current == p {
-                        self.show_cursor()?;
-                        self.current_pos = None;
-                    };
-                }
-                self.active_clients.remove(&p);
-            }
             ProducerEvent::EventTapDisabled => {
                 // Tap death can happen mid-capture (TCC Accessibility
                 // revoked, tap-timeout, etc). Release state so we
@@ -629,9 +600,6 @@ fn create_event_tap<'a>(
                     0.5
                 });
                 res_events.push(CaptureEvent::Begin(t));
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
             }
         }
 
@@ -757,8 +725,8 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 
 pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
-    notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    state: Arc<Mutex<InputCaptureState>>,
 }
 
 impl MacOSInputCapture {
@@ -766,7 +734,7 @@ impl MacOSInputCapture {
         request_macos_capture_permissions()?;
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
-        let (event_tx, event_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(1024);
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -791,6 +759,7 @@ impl MacOSInputCapture {
         // wait for event tap creation result
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
+        let tap_state = state.clone();
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -798,7 +767,7 @@ impl MacOSInputCapture {
                         let Some(producer_event) = producer_event else {
                             break;
                         };
-                        let mut state = state.lock().await;
+                        let mut state = tap_state.lock().await;
                         state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
@@ -806,14 +775,17 @@ impl MacOSInputCapture {
                     _ = &mut tap_exit_rx => break,
                 }
             }
-            // show cursor
-            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+            if let Ok(mut state) = tap_state.try_lock() {
+                let _ = state.show_cursor();
+            } else {
+                let _ = CGDisplay::show_cursor(&CGDisplay::main());
+            }
         });
 
         Ok(Self {
             event_rx,
-            notify_tx,
             run_loop,
+            state,
         })
     }
 }
@@ -853,51 +825,61 @@ fn request_input_monitoring_permission() -> bool {
 impl Drop for MacOSInputCapture {
     fn drop(&mut self) {
         self.run_loop.stop();
+        if let Ok(mut state) = self.state.try_lock() {
+            let _ = state.show_cursor();
+        } else {
+            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+        }
     }
 }
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("creating capture, {pos}");
+        let mut state = self.state.lock().await;
+        state.active_clients.insert(pos);
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        let mut state = self.state.lock().await;
+        if let Some(current) = state.current_pos {
+            if current == pos {
+                state.show_cursor()?;
+                state.current_pos = None;
+            }
+        }
+        state.active_clients.remove(&pos);
         Ok(())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
-        });
+        log::debug!("releasing capture");
+        let mut state = self.state.lock().await;
+        if state.current_pos.is_some() {
+            state.show_cursor()?;
+            state.current_pos = None;
+        }
         Ok(())
     }
 
     async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying ReleaseTo({t:.2})");
-            let _ = notify_tx.send(ProducerEvent::ReleaseTo(t)).await;
-        });
+        log::debug!("notifying ReleaseTo({t:.2})");
+        let mut state = self.state.lock().await;
+        if state.current_pos.is_some() {
+            if let Some(point) = state.release_point(t) {
+                CGDisplay::warp_mouse_cursor_position(point).map_err(CaptureError::WarpCursor)?;
+            }
+            state.show_cursor()?;
+            state.current_pos = None;
+        }
         Ok(())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        Ok(())
+        self.release().await
     }
 }
 

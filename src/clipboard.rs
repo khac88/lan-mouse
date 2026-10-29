@@ -291,6 +291,48 @@ impl Drop for ClipboardManager {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn get_clipboard_sequence() -> Option<i64> {
+    use std::ffi::{c_char, c_void};
+    type Id = *mut c_void;
+    type Sel = *const c_void;
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    unsafe {
+        let cls = objc_getClass(c"NSPasteboard".as_ptr());
+        if cls.is_null() {
+            return None;
+        }
+        let sel_general = sel_registerName(c"generalPasteboard".as_ptr());
+        let msg_send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as *const ());
+        let pb = msg_send_id(cls, sel_general);
+        if pb.is_null() {
+            return None;
+        }
+        let sel_change_count = sel_registerName(c"changeCount".as_ptr());
+        let msg_send_isize: unsafe extern "C" fn(Id, Sel) -> isize =
+            std::mem::transmute(objc_msgSend as *const ());
+        Some(msg_send_isize(pb, sel_change_count) as i64)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_clipboard_sequence() -> Option<i64> {
+    extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    Some(unsafe { GetClipboardSequenceNumber() } as i64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_clipboard_sequence() -> Option<i64> {
+    None
+}
+
 fn run_clipboard_worker(
     cmd_rx: StdReceiver<WorkerCmd>,
     out_tx: UnboundedSender<OutboundClipboard>,
@@ -304,6 +346,7 @@ fn run_clipboard_worker(
     };
 
     let mut last_hash: Option<[u8; 32]> = None;
+    let mut last_seq = get_clipboard_sequence();
     let mut suppress_echo_until = Instant::now();
 
     // Initialize with current clipboard content so we don't spam peers on startup
@@ -326,6 +369,7 @@ fn run_clipboard_worker(
                         log::warn!("failed to set clipboard text: {e}");
                     } else {
                         log::info!("clipboard: text updated from remote peer");
+                        last_seq = get_clipboard_sequence();
                     }
                 }
                 WorkerCmd::WriteImage {
@@ -349,57 +393,67 @@ fn run_clipboard_worker(
                             width,
                             height
                         );
+                        last_seq = get_clipboard_sequence();
                     }
                 }
                 WorkerCmd::Shutdown => return,
             }
         }
 
-        let now = Instant::now();
+        let current_seq = get_clipboard_sequence();
+        let changed = match (current_seq, last_seq) {
+            (Some(curr), Some(last)) => curr != last,
+            _ => true,
+        };
 
-        // Poll system clipboard for local changes
-        if let Ok(text) = clipboard.get_text() {
-            if !text.is_empty() {
-                let bytes = text.into_bytes();
-                let hash = content_hash(ClipboardFormat::Text, &bytes);
-                if now < suppress_echo_until {
-                    last_hash = Some(hash);
-                } else if last_hash != Some(hash) {
-                    last_hash = Some(hash);
-                    log::info!("clipboard: local text copied ({} bytes)", bytes.len());
-                    let _ = out_tx.send(OutboundClipboard {
-                        format: ClipboardFormat::Text,
-                        data: bytes,
-                    });
-                }
-            }
-        } else if let Ok(img) = clipboard.get_image() {
-            let raw_hash = content_hash(ClipboardFormat::Png, &img.bytes);
-            if now < suppress_echo_until {
-                last_hash = Some(raw_hash);
-            } else if last_hash != Some(raw_hash) {
-                last_hash = Some(raw_hash);
-                match encode_png(img.width as u32, img.height as u32, &img.bytes) {
-                    Ok(png_bytes) => {
-                        log::info!(
-                            "clipboard: local image copied ({}x{}, {} bytes PNG)",
-                            img.width,
-                            img.height,
-                            png_bytes.len()
-                        );
+        if changed {
+            last_seq = current_seq;
+            let now = Instant::now();
+
+            // Poll system clipboard for local changes
+            if let Ok(text) = clipboard.get_text() {
+                if !text.is_empty() {
+                    let bytes = text.into_bytes();
+                    let hash = content_hash(ClipboardFormat::Text, &bytes);
+                    if now < suppress_echo_until {
+                        last_hash = Some(hash);
+                    } else if last_hash != Some(hash) {
+                        last_hash = Some(hash);
+                        log::info!("clipboard: local text copied ({} bytes)", bytes.len());
                         let _ = out_tx.send(OutboundClipboard {
-                            format: ClipboardFormat::Png,
-                            data: png_bytes,
+                            format: ClipboardFormat::Text,
+                            data: bytes,
                         });
                     }
-                    Err(e) => {
-                        log::warn!("failed to encode clipboard image to PNG: {e}");
+                }
+            } else if let Ok(img) = clipboard.get_image() {
+                let raw_hash = content_hash(ClipboardFormat::Png, &img.bytes);
+                if now < suppress_echo_until {
+                    last_hash = Some(raw_hash);
+                } else if last_hash != Some(raw_hash) {
+                    last_hash = Some(raw_hash);
+                    match encode_png(img.width as u32, img.height as u32, &img.bytes) {
+                        Ok(png_bytes) => {
+                            log::info!(
+                                "clipboard: local image copied ({}x{}, {} bytes PNG)",
+                                img.width,
+                                img.height,
+                                png_bytes.len()
+                            );
+                            let _ = out_tx.send(OutboundClipboard {
+                                format: ClipboardFormat::Png,
+                                data: png_bytes,
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!("failed to encode clipboard image to PNG: {e}");
+                        }
                     }
                 }
             }
         }
 
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(Duration::from_millis(150));
     }
 }
 
