@@ -23,13 +23,6 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 > - 🍏 **All-in-One macOS Native Menu Bar:** Standalone configuration window eliminated on macOS in favor of a fast, native status bar menu with live connection indicators, per-client toggles, and edge position controls.
 > - ⚡ **Zero-Latency Ghost Cursor Fix:** Instant CoreGraphics cursor capture and balanced cursor visibility tracking, eliminating cursor lingering or ghosting across screens.
 
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
-    <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of Lan-Mouse" srcset="/screenshots/dark.png">
-</picture>
-
-
 ## Encryption
 
 Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
