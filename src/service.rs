@@ -271,6 +271,14 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::UpdateSyncSound(handle, sync_sound) => {
+                self.update_sync_sound(handle, sync_sound);
+                self.save_config();
+            }
+            FrontendRequest::UpdateSyncClipboard(handle, sync_clipboard) => {
+                self.update_sync_clipboard(handle, sync_clipboard);
+                self.save_config();
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -286,6 +294,8 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                sync_sound: c.sync_sound,
+                sync_clipboard: c.sync_clipboard,
             })
             .collect();
         self.config.set_clients(clients);
@@ -688,6 +698,16 @@ impl Service {
 
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
+        self.broadcast_client(handle);
+    }
+
+    fn update_sync_sound(&mut self, handle: ClientHandle, sync_sound: bool) {
+        self.client_manager.set_sync_sound(handle, sync_sound);
+        self.broadcast_client(handle);
+    }
+
+    fn update_sync_clipboard(&mut self, handle: ClientHandle, sync_clipboard: bool) {
+        self.client_manager.set_sync_clipboard(handle, sync_clipboard);
         self.broadcast_client(handle);
     }
 

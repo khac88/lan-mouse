@@ -69,6 +69,28 @@
 				</property>
 			</object>
 		</child>
+		<!-- sync sound -->
+		<child>
+			<object class="AdwActionRow" id="sync_sound_row">
+				<property name="title" translatable="yes">Sync Sound</property>
+				<child>
+					<object class="GtkSwitch" id="sync_sound_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<!-- sync clipboard -->
+		<child>
+			<object class="AdwActionRow" id="sync_clipboard_row">
+				<property name="title" translatable="yes">Sync Clipboard</property>
+				<child>
+					<object class="GtkSwitch" id="sync_clipboard_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

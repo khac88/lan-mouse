@@ -169,7 +169,12 @@ impl LanMouseConnection {
     pub(crate) async fn broadcast_clipboard(&self, msg: &ClipboardMsg) {
         let buf = msg.encode();
         let conns = self.conns.lock().await;
-        for conn in conns.values() {
+        for (addr, conn) in conns.iter() {
+            if let Some(handle) = self.client_manager.get_client(*addr) {
+                if !self.client_manager.sync_clipboard(handle) {
+                    continue;
+                }
+            }
             let _ = conn.send(&buf).await;
         }
     }
@@ -517,19 +522,23 @@ async fn receive_loop(
                     frame.samples.len()
                 );
                 #[cfg(feature = "audio")]
-                if let Some(ref player) = *audio_player.borrow() {
-                    player.push_packet(
-                        frame.seq,
-                        frame.sample_rate,
-                        frame.channels,
-                        &frame.samples,
-                    );
+                if client_manager.sync_sound(handle) {
+                    if let Some(ref player) = *audio_player.borrow() {
+                        player.push_packet(
+                            frame.seq,
+                            frame.sample_rate,
+                            frame.channels,
+                            &frame.samples,
+                        );
+                    }
                 }
             }
             Ok(Datagram::Clipboard(msg)) => {
                 log::trace!("received clipboard datagram on connect side from {addr}");
-                if let Some(ref cb) = *clipboard.borrow() {
-                    cb.handle_incoming(msg);
+                if client_manager.sync_clipboard(handle) {
+                    if let Some(ref cb) = *clipboard.borrow() {
+                        cb.handle_incoming(msg);
+                    }
                 }
             }
             // Skip undecodable datagrams without dropping the

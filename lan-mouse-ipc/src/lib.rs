@@ -128,6 +128,10 @@ impl TryFrom<&str> for Position {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
@@ -140,6 +144,12 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// synchronize sound with this client
+    #[serde(default = "default_true")]
+    pub sync_sound: bool,
+    /// synchronize clipboard with this client
+    #[serde(default = "default_true")]
+    pub sync_clipboard: bool,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +160,8 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            sync_sound: true,
+            sync_clipboard: true,
         }
     }
 }
@@ -259,6 +271,10 @@ pub enum FrontendRequest {
     RemoveAuthorizedKey(String),
     /// change the hook command
     UpdateEnterHook(u64, Option<String>),
+    /// update sound synchronization toggle
+    UpdateSyncSound(ClientHandle, bool),
+    /// update clipboard synchronization toggle
+    UpdateSyncClipboard(ClientHandle, bool),
     /// save config file
     SaveConfiguration,
 }

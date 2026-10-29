@@ -145,6 +145,9 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    #[serde(alias = "sync_audio")]
+    sync_sound: Option<bool>,
+    sync_clipboard: Option<bool>,
 }
 
 impl ConfigToml {
@@ -346,6 +349,8 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    pub sync_sound: bool,
+    pub sync_clipboard: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -356,6 +361,8 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let sync_sound = toml.sync_sound.unwrap_or(true);
+        let sync_clipboard = toml.sync_clipboard.unwrap_or(true);
         Self {
             ips,
             hostname,
@@ -363,6 +370,8 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            sync_sound,
+            sync_clipboard,
         }
     }
 }
@@ -382,6 +391,12 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
+        let sync_sound = if client.sync_sound { None } else { Some(false) };
+        let sync_clipboard = if client.sync_clipboard {
+            None
+        } else {
+            Some(false)
+        };
         Self {
             hostname,
             host_name,
@@ -390,6 +405,8 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            sync_sound,
+            sync_clipboard,
         }
     }
 }

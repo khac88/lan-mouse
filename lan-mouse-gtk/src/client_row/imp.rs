@@ -25,6 +25,14 @@ pub struct ClientRow {
     #[template_child]
     pub position: TemplateChild<ComboRow>,
     #[template_child]
+    pub sync_sound_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub sync_sound_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub sync_clipboard_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub sync_clipboard_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
     pub delete_row: TemplateChild<ActionRow>,
     #[template_child]
     pub delete_button: TemplateChild<gtk::Button>,
@@ -35,6 +43,8 @@ pub struct ClientRow {
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
+    sync_sound_change_handler: RefCell<Option<SignalHandlerId>>,
+    sync_clipboard_change_handler: RefCell<Option<SignalHandlerId>>,
     pub client_object: RefCell<Option<ClientObject>>,
 }
 
@@ -102,6 +112,28 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.set_state_handler.replace(Some(handler));
+        let handler = self.sync_sound_switch.connect_state_set(clone!(
+            #[weak(rename_to = row)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |switch, state| {
+                row.handle_sync_sound_switch(state, switch);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.sync_sound_change_handler.replace(Some(handler));
+        let handler = self.sync_clipboard_switch.connect_state_set(clone!(
+            #[weak(rename_to = row)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |switch, state| {
+                row.handle_sync_clipboard_switch(state, switch);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.sync_clipboard_change_handler.replace(Some(handler));
     }
 
     fn signals() -> &'static [glib::subclass::Signal] {
@@ -122,6 +154,12 @@ impl ObjectImpl for ClientRow {
                 Signal::builder("request-position-change")
                     .param_types([u32::static_type()])
                     .build(),
+                Signal::builder("request-sync-sound")
+                    .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-sync-clipboard")
+                    .param_types([bool::static_type()])
+                    .build(),
             ]
         })
     }
@@ -133,6 +171,16 @@ impl ClientRow {
     fn handle_activate_switch(&self, state: bool, _switch: &Switch) -> bool {
         self.obj().emit_by_name::<()>("request-activate", &[&state]);
         true // dont run default handler
+    }
+
+    fn handle_sync_sound_switch(&self, state: bool, _switch: &Switch) -> bool {
+        self.obj().emit_by_name::<()>("request-sync-sound", &[&state]);
+        true
+    }
+
+    fn handle_sync_clipboard_switch(&self, state: bool, _switch: &Switch) -> bool {
+        self.obj().emit_by_name::<()>("request-sync-clipboard", &[&state]);
+        true
     }
 
     #[template_callback]
@@ -212,6 +260,30 @@ impl ClientRow {
             .expect("client object")
             .set_active(active);
         self.enable_switch.unblock_signal(handler);
+    }
+
+    pub(super) fn set_sync_sound(&self, sync: bool) {
+        let handler = self.sync_sound_change_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.sync_sound_switch.block_signal(handler);
+        self.client_object
+            .borrow_mut()
+            .as_mut()
+            .expect("client object")
+            .set_sync_sound(sync);
+        self.sync_sound_switch.unblock_signal(handler);
+    }
+
+    pub(super) fn set_sync_clipboard(&self, sync: bool) {
+        let handler = self.sync_clipboard_change_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.sync_clipboard_switch.block_signal(handler);
+        self.client_object
+            .borrow_mut()
+            .as_mut()
+            .expect("client object")
+            .set_sync_clipboard(sync);
+        self.sync_clipboard_switch.unblock_signal(handler);
     }
 
     pub(super) fn set_dns_state(&self, resolved: bool) {

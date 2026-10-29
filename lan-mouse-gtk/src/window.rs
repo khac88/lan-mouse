@@ -238,6 +238,38 @@ impl Window {
                             }
                         ),
                     );
+                    row.connect_closure(
+                        "request-sync-sound",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, sync: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::UpdateSyncSound(
+                                        client.handle(),
+                                        sync,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
+                        "request-sync-clipboard",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, sync: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::UpdateSyncClipboard(
+                                        client.handle(),
+                                        sync,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
                     row.upcast()
                 }
             ),
@@ -340,6 +372,8 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        row.set_sync_sound(client.sync_sound);
+        row.set_sync_clipboard(client.sync_clipboard);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {

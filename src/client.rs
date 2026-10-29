@@ -33,6 +33,8 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            sync_sound: config_client.sync_sound,
+            sync_clipboard: config_client.sync_clipboard,
         };
         let state = ClientState {
             active: config_client.active,
@@ -234,6 +236,38 @@ impl ClientManager {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             c.cmd = enter_hook;
         }
+    }
+
+    /// update sync sound toggle
+    pub(crate) fn set_sync_sound(&self, handle: ClientHandle, sync_sound: bool) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.sync_sound = sync_sound;
+        }
+    }
+
+    /// update sync clipboard toggle
+    pub(crate) fn set_sync_clipboard(&self, handle: ClientHandle, sync_clipboard: bool) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.sync_clipboard = sync_clipboard;
+        }
+    }
+
+    /// get sync sound toggle
+    pub fn sync_sound(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.sync_sound)
+            .unwrap_or(true)
+    }
+
+    /// get sync clipboard toggle
+    pub fn sync_clipboard(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.sync_clipboard)
+            .unwrap_or(true)
     }
 
     /// set resolving status of the client

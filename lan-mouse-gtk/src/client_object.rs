@@ -27,6 +27,8 @@ impl ClientObject {
             )
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
+            .property("sync-sound", client.sync_sound)
+            .property("sync-clipboard", client.sync_clipboard)
             .build()
     }
 
@@ -43,7 +45,7 @@ pub fn peer_commit_to_string(commit: Option<[u8; 8]>) -> Option<String> {
     commit.and_then(|c| std::str::from_utf8(&c).ok().map(str::to_string))
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ClientData {
     pub handle: ClientHandle,
     pub hostname: Option<String>,
@@ -53,4 +55,23 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    pub sync_sound: bool,
+    pub sync_clipboard: bool,
+}
+
+impl Default for ClientData {
+    fn default() -> Self {
+        Self {
+            handle: 0,
+            hostname: None,
+            port: 0,
+            active: false,
+            position: String::new(),
+            resolving: false,
+            ips: Vec::new(),
+            peer_commit: None,
+            sync_sound: true,
+            sync_clipboard: true,
+        }
+    }
 }

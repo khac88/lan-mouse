@@ -124,6 +124,38 @@ impl ClientRow {
         bindings.push(resolve_binding);
         bindings.push(ip_binding);
 
+        // bind sync sound
+        let sync_sound_binding = client_object
+            .bind_property("sync-sound", &self.imp().sync_sound_switch.get(), "active")
+            .sync_create()
+            .build();
+        let sync_sound_state_binding = client_object
+            .bind_property("sync-sound", &self.imp().sync_sound_switch.get(), "state")
+            .sync_create()
+            .build();
+        bindings.push(sync_sound_binding);
+        bindings.push(sync_sound_state_binding);
+
+        // bind sync clipboard
+        let sync_clipboard_binding = client_object
+            .bind_property(
+                "sync-clipboard",
+                &self.imp().sync_clipboard_switch.get(),
+                "active",
+            )
+            .sync_create()
+            .build();
+        let sync_clipboard_state_binding = client_object
+            .bind_property(
+                "sync-clipboard",
+                &self.imp().sync_clipboard_switch.get(),
+                "state",
+            )
+            .sync_create()
+            .build();
+        bindings.push(sync_clipboard_binding);
+        bindings.push(sync_clipboard_state_binding);
+
         // Render the initial collapsed subtitle from whatever
         // peer_commit the ClientObject was created with. Subsequent
         // changes are pushed by `Window::update_client_state` calling
@@ -139,6 +171,14 @@ impl ClientRow {
 
     pub fn set_active(&self, active: bool) {
         self.imp().set_active(active);
+    }
+
+    pub fn set_sync_sound(&self, sync: bool) {
+        self.imp().set_sync_sound(sync);
+    }
+
+    pub fn set_sync_clipboard(&self, sync: bool) {
+        self.imp().set_sync_clipboard(sync);
     }
 
     pub fn set_hostname(&self, hostname: Option<String>) {
