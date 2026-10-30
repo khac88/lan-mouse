@@ -33,6 +33,12 @@ pub(crate) struct WindowsEmulation {
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
+            };
+            let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        }
         Ok(Self { repeat_task: None })
     }
 }

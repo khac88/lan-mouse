@@ -338,6 +338,16 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
+    /* no clients registered to capture towards, skip all barrier calculations */
+    if CLIENTS.with_borrow(|clients| clients.is_empty()) {
+        return ret;
+    }
+
+    /* synthetic / injected mouse events from SendInput cannot activate physical barriers */
+    if (mouse_low_level.flags & 1) != 0 {
+        return ret;
+    }
+
     /* check if a client was activated */
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
