@@ -251,18 +251,14 @@ impl InputCaptureState {
 /// Whether `event` came from real keyboard hardware, as opposed to
 /// being synthesized by another process.
 ///
-/// Vietnamese (and other) input method engines implement diacritic
-/// composition by deleting the real keystroke from the event stream
-/// and re-injecting a correction: a synthetic Backspace plus a
-/// synthetic "letter" event that carries a placeholder keycode (the
-/// actual composed character rides along in a separate Unicode-string
-/// field this capture never reads). If our tap sees these before the
-/// IME's own tap — tap ordering between two unrelated processes isn't
-/// something either controls — we'd forward that placeholder keycode
-/// to the peer as if it were what the user typed, which is wrong more
-/// often than not. Genuine hardware input reports
+/// While installing our tap at [`CGEventTapLocation::HID`] ensures we
+/// intercept hardware keystrokes before session-level IMEs (such as
+/// OpenKey or EVKey at `kCGSessionEventTap`), third-party remappers or
+/// IMEs that inject synthetic events directly at `kCGHIDEventTap` (e.g.
+/// synthetic Backspace + Unicode placeholder keycodes) would still
+/// reach this callback. Genuine hardware input reports
 /// [`CGEventSourceStateID::HIDSystemState`]; synthetic events created
-/// via `CGEventSourceCreate` with some other state (IMEs typically use
+/// via `CGEventSourceCreate` with some other state (typically
 /// `Private`) don't.
 fn is_genuine_hardware_event(event: &CGEvent) -> bool {
     event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID)
@@ -618,8 +614,18 @@ fn create_event_tap<'a>(
         }
     };
 
+    // Install at `HID` (`kCGHIDEventTap`) rather than `Session`
+    // (`kCGSessionEventTap`). System-wide IMEs on macOS (e.g. OpenKey,
+    // EVKey) install their taps at `kCGSessionEventTap`; in the
+    // WindowServer pipeline, `kCGHIDEventTap` always runs strictly
+    // before `kCGSessionEventTap` regardless of process start order.
+    // When capture is active we drop the event here at the HID stage,
+    // so the local IME never sees (and never swallows) Telex/VNI
+    // keystrokes meant for the remote machine, while local typing when
+    // not capturing passes through (`CallbackResult::Keep`) to the
+    // session-level IME untouched.
     let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
+        CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         cg_events_of_interest,

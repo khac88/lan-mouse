@@ -35,7 +35,7 @@ impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
         unsafe {
             use windows::Win32::System::Threading::{
-                GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
+                GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
             };
             let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
         }
